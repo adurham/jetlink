@@ -27,6 +27,10 @@ CABLE_ADDRESS = '192.168.60.1'
 
 
 class TcpTransport(StreamTransport):
+  # what the hello says of this link, when the opener knows better than the
+  # addresses (a Wi-Fi dial sets jetlink.comma.wifi.link_info)
+  link: dict | None = None
+
   def __init__(self, sock: socket.socket):
     super().__init__()
     self.sock = sock
@@ -43,6 +47,8 @@ class TcpTransport(StreamTransport):
       return False
 
   def link_info(self) -> dict:
+    if self.link is not None:
+      return self.link
     return usb_link_info('cable', udc_speed()) if self.on_the_cable() else {'kind': 'tcp'}
 
   @classmethod
