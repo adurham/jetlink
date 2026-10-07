@@ -101,7 +101,7 @@ class Flag(IntEnum):
                           # a caller logging the whole output vector. 64 KB more
                           # on the big models; nothing else needs it.
   LOSSLESS = 1 << 3       # on INFER_REQ: the frame is packed (LOSSLESS_CODEC),
-                          # laid out as pack_lossless says. Only to a server
+                          # as jetlink.lossless.Packer packs it. Only to a server
                           # whose hello lists the codec in 'frame_codecs'
   PADDED = 1 << 7         # one pad byte follows the payload; see PACKET_MULTIPLE
 
@@ -124,7 +124,6 @@ _infer_resp = struct.Struct(INFER_RESP_FMT)
 # head, the packed floats (their size from the handshake, as ever), a u32 size
 # per plane, then the planes. A server that takes it says so in its hello
 LOSSLESS_CODEC = 'med-zstd'
-_u32 = struct.Struct('<I')
 
 
 class ProtocolError(RuntimeError):
@@ -167,7 +166,3 @@ class Status(IntEnum):
   INFER_FAILED = 3
   NOT_FINITE = 4      # model produced NaN/Inf; caller must fall back
 
-
-def lossless_sizes(sizes) -> bytes:
-  """The size table that leads a lossless frame's planes."""
-  return b''.join(_u32.pack(n) for n in sizes)
