@@ -1717,6 +1717,34 @@ class MidDriveTest(JoiningBase):
       self.small.vx = 0.0
       self.assertIsNotNone(self._first_big(s, joining.REJOIN_FRAMES * 2))
 
+  def test_a_small_frame_without_a_plan_is_not_a_set_off(self):
+    # the review of 2ba97a5: a small-model frame whose outputs carry no
+    # plan was read as the car setting off (stationary(None) is False), so
+    # the stop's one try was given back and a second try ran at the SAME
+    # stop. A frame without a plan says nothing either way: the try stays
+    n = joining.REJOIN_HOLD_FRAMES
+    with mock.patch.object(joining, 'REJOIN_DELAY_QUICK', 0.01):
+      s = self._held(WarmingModel([3.5] * 200))
+      self._hold(s)
+      self.assertTrue(s._stop_tried)
+      self.assertEqual(self.big.calls, n)
+      # one frame without a plan, the car still stopped
+      self.small.plans = False
+      self._run(s)
+      self.assertTrue(s._stop_tried, 'a frame without a plan gave the stop its try back')
+      self.small.plans = True
+      self._run(s)
+      self.assertTrue(s._stop_tried)
+      # the link back and proven, the stop still held: no second try
+      self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+      self._proven(s)
+      self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+      self.assertEqual(self.big.calls, n, 'a second try ran at the same stop')
+      # a plan that does set off still gives the next stop its try
+      self.small.vx = 5.0
+      self._frames(s, 3)
+      self.assertFalse(s._stop_tried)
+
   def _first_try(self, s):
     for i in range(1, joining.REJOIN_FRAMES + 5):
       self._run(s)

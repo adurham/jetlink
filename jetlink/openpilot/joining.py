@@ -509,7 +509,7 @@ class JoiningModelState:
     result = self._small.run(bufs, transforms, inputs, after_enqueue)
     if self._ask_rejoin is not None:
       self._small_plan = plan_of(result)
-      if self._stop_tried and not stationary(self._small_plan):
+      if self._stop_tried and self._small_plan is not None and not stationary(self._small_plan):
         self._stop_tried = False
     return result
 
