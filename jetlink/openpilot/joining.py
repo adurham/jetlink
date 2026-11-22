@@ -606,7 +606,7 @@ class JoiningModelState:
     and a set-off, are the ones modelV2 carried."""
     if self._ask_rejoin is not None:
       self._small_plan = plan_of(result)
-      if self._stop_tried and not stationary(self._small_plan):
+      if self._stop_tried and self._small_plan is not None and not stationary(self._small_plan):
         self._stop_tried = False
 
   def _count_rejoin(self) -> None:
