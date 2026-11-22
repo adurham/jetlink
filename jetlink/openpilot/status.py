@@ -32,7 +32,8 @@ PROGRESS_MIN_INTERVAL = 0.25
 # what a progress record's `code` may be, for a fork that words the line
 # itself; `msg` stays the English one. `args`, where a code has them:
 # downloading, download and upload {got_mb, total_mb}, download_stalled
-# {retry_s}, reconnecting {why: lost, behind, load_failed or bad_output},
+# {retry_s}, reconnecting {why: lost, behind, load_failed, bad_output or
+# discontinuous},
 # build {eta_s}. downloading is the comma fetching the model, download the
 # server fetching it itself. From download on they are stage names, and the
 # server's stages are its own:

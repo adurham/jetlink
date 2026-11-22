@@ -1400,6 +1400,372 @@ class RuntimeRecordTest(JoiningBase):
       self.assertEqual(s._name_of('a' * 64, names), 'Big Model')  # a real name is kept
 
 
+def plan(vx=0.0, y=0.0):
+  """A parsed plan as modeld's Parser leaves it, (1, IDX_N, PLAN_WIDTH):
+  forward speed `vx` and lateral position `y` at every point, or arrays of
+  IDX_N for a plan that changes over its horizon."""
+  p = np.zeros((1, joining.PLAN_IDX_N, 15), np.float32)
+  p[0, :, joining.PLAN_VX] = vx
+  p[0, :, joining.PLAN_Y] = y
+  return p
+
+
+class PlanModel(FakeModel):
+  """A model whose outputs carry a plan, as every fork's parsed outputs do."""
+
+  def __init__(self, name, chestnut=False, client=None, vx=0.0, y=0.0):
+    super().__init__(name, chestnut, client)
+    self.vx, self.y = vx, y
+    self.plans = True
+
+  def run(self, bufs, transforms, inputs, after_enqueue=None):
+    out = super().run(bufs, transforms, inputs, after_enqueue)
+    if self.plans:
+      out['plan'] = plan(self.vx, self.y)
+    return out
+
+
+class MidDriveTest(JoiningBase):
+  """The adapter's mid-drive window (ModelSide.mid_drive_window): with MADS
+  in control for a whole drive, a ready link may still swap in at a held
+  stop, where nothing the model outputs reaches an actuator, and only onto a
+  plan the large model continues. Off without the adapter's window, which is
+  the drive of 2026-11-19: four fallbacks that never came back."""
+
+  def setUp(self):
+    super().setUp()
+    # a link proves itself in a tenth of a second here, not two
+    for name, value in (('REJOIN_PING_PERIOD', 0.005), ('REJOIN_READY_S', 0.05)):
+      p = mock.patch.object(joining, name, value)
+      p.start()
+      self.addCleanup(p.stop)
+    self.small = PlanModel('small')
+    self.big = PlanModel('big', chestnut=True, client=mock.Mock(dead=False))
+    self.reset = mock.Mock()
+    # what the adapter's window answers: a held stop, nothing active
+    self.held = True
+    self.asked = 0
+
+  def window(self):
+    self.asked += 1
+    return self.held
+
+  def _windowed(self, window=None, **kwargs):
+    s = self._make(self.small, self._connect, self._build, reset_small=self.reset,
+                   rejoin=self.window if window is None else window, **kwargs)
+    self.addCleanup(self._close, s)
+    self._wait_joined(s)
+    return s
+
+  def _proven(self, s):
+    """Until the waiting link has been ready REJOIN_READY_S and answered REJOIN_PINGS keepalives."""
+    self.assertTrue(wait_for(lambda: s._pings >= joining.REJOIN_PINGS
+                             and time.monotonic() - s._ready_at >= joining.REJOIN_READY_S))
+
+  def _frames(self, s, n):
+    """The model that drove each of `n` frames."""
+    return [self._run(s)['from'] for _ in range(n)]
+
+  def _first_big(self, s, limit):
+    for i in range(1, limit + 1):
+      if self._run(s)['from'] == 'big':
+        return i
+    return None
+
+  # -- (a) off: the drive as it was ----------------------------------------------
+
+  def test_without_a_window_a_stop_in_control_never_swaps(self):
+    # b5 03:01 and b6 00:29: a full openpilot cancel and re-engage, MADS on
+    # throughout. in_control is True on every frame, so nothing swaps,
+    # however long the stop and however ready the link
+    s = self._make(self.small, self._connect, self._build)
+    self.addCleanup(self._close, s)
+    self._wait_joined(s)
+    self.assertIsNone(s._ask_rejoin)
+    s.in_control = True
+    self.assertEqual(set(self._frames(s, 200)), {'small'})
+    self.assertEqual(self.big.calls, 0)
+    self.assertEqual(s.big_model_state, 'ready')
+    self.assertFalse(self.log.has('swapping the large model in mid-drive'))
+    # the window that did exist that night is unchanged: MADS off, at once
+    s.in_control = False
+    self.assertEqual(self._run(s)['from'], 'big')
+
+  def test_without_a_window_the_keepalive_keeps_its_period(self):
+    # the window's pings every REJOIN_PING_PERIOD are its own
+    with mock.patch.object(joining, 'KEEPALIVE_PERIOD', 30.0):
+      s = self._make(self.small, self._connect, self._build)
+      self.addCleanup(self._close, s)
+      self._wait_joined(s)
+      client = s._joined[0]
+      time.sleep(40 * joining.REJOIN_PING_PERIOD)
+      client.ping.assert_not_called()
+      self.assertEqual(s._pings, 0)
+
+  def test_an_adapter_without_one_or_with_a_broken_one_has_no_window(self):
+    log = RecordingLog()
+    self.assertIsNone(joining.mid_drive_window(SimpleNamespace(), log))
+    self.assertIsNone(joining.mid_drive_window(SimpleNamespace(mid_drive_window=lambda: None), log))
+    self.assertEqual(log.lines('warning') + log.lines('error') + log.lines('exception'), [])
+
+    def broken():
+      raise RuntimeError('no SubMaster')
+
+    self.assertIsNone(joining.mid_drive_window(SimpleNamespace(mid_drive_window=broken), log))
+    self.assertEqual(len(log.lines('exception')), 1)
+    # a flag where a callable belongs is the likeliest slip: no window, said
+    self.assertIsNone(joining.mid_drive_window(SimpleNamespace(mid_drive_window=lambda: True), log))
+    self.assertEqual(len(log.lines('error')), 1)
+    window = lambda: True   # noqa: E731
+    self.assertIs(joining.mid_drive_window(SimpleNamespace(mid_drive_window=lambda: window), log), window)
+    self.assertTrue(log.has('may also swap in mid-drive', 'warning'))
+
+  # -- (b) a held stop -------------------------------------------------------------
+
+  def test_a_held_stop_swaps_a_proven_link_in(self):
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True   # MADS
+    handovers = s.handovers
+    first = self._first_big(s, joining.REJOIN_FRAMES + 5)
+    # the window said so for REJOIN_FRAMES frames running, the swap frame's included;
+    # a keepalive holding the link at that frame moves it one on
+    self.assertIn(first, range(joining.REJOIN_FRAMES, joining.REJOIN_FRAMES + 3))
+    self.assertTrue(s.chestnut)
+    self.assertEqual(s.handovers, handovers + 1)
+    self.assertEqual(s.big_model_state, 'running')
+    self.assertTrue(self.log.has('swapping the large model in mid-drive', 'warning'))
+    self.reset.assert_not_called()
+    self.assertEqual(self._frames(s, 5), ['big'] * 5)
+
+  def test_a_stop_that_does_not_hold_starts_the_count_again(self):
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES - 1)), {'small'})
+    self.held = False   # a roll, a press, a blip
+    self.assertEqual(self._run(s)['from'], 'small')
+    self.held = True
+    self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES - 1)), {'small'})
+    self.assertIsNotNone(self._first_big(s, 4))
+
+  def test_the_window_is_asked_only_while_a_ready_link_waits_in_control(self):
+    self.connect_error = RuntimeError('phone not up')
+    s = self._make(self.small, self._connect, self._build, rejoin=self.window)
+    self.addCleanup(self._close, s)
+    s.in_control = True
+    self._frames(s, 10)
+    self.assertEqual(self.asked, 0, 'no link: nothing to open a window for')
+
+  def test_an_answer_that_is_not_true_is_a_no(self):
+    for answer in (1, 'yes', np.bool_(True), None):
+      with self.subTest(answer=answer):
+        self.small, self.big = PlanModel('small'), PlanModel('big', chestnut=True, client=mock.Mock(dead=False))
+        s = self._windowed(window=lambda answer=answer: answer)
+        self._proven(s)
+        s.in_control = True
+        self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 2)), {'small'})
+
+  def test_a_window_that_raises_is_closed_and_said_once(self):
+    def window():
+      raise KeyError('carControlSP')
+
+    s = self._windowed(window=window)
+    self._proven(s)
+    s.in_control = True
+    self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 2)), {'small'})
+    self.assertEqual(self.log.lines('exception'), ['jetlink: the mid-drive window failed, counted as closed'])
+
+  # -- (c) a plan that sets off --------------------------------------------------
+
+  def test_a_small_plan_that_sets_off_is_no_window(self):
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    self.small.vx = joining.REJOIN_PLAN_SPEED + 0.1   # the lead has gone
+    self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+    self.assertEqual(self.big.calls, 0)
+    # held, and planning to stay: the next frame may swap
+    self.small.vx = 0.0
+    self.assertEqual(self._run(s)['from'], 'small')   # that plan is read after this frame
+    self.assertIsNotNone(self._first_big(s, 3))
+
+  def test_the_plan_is_read_over_its_first_two_seconds(self):
+    # T_IDXS = 10 (i / 32)^2: index 14 is 1.91 s, 15 is 2.20 s
+    self.assertEqual(joining.REJOIN_HORIZON, 15)
+    for at, swaps in ((joining.REJOIN_HORIZON - 1, False), (joining.REJOIN_HORIZON, True)):
+      with self.subTest(sets_off_at=at):
+        vx = np.zeros(joining.PLAN_IDX_N)
+        vx[at:] = 2.0
+        self.assertEqual(joining.stationary(joining.plan_of({'plan': plan(vx)})), swaps)
+    # and a plan modeld could not have parsed is no stop
+    for bad in ({}, {'plan': np.zeros((1, 32, 15))}, {'plan': plan(np.nan)}, None):
+      with self.subTest(bad=bad):
+        self.assertFalse(joining.stationary(joining.plan_of(bad)))
+
+  def test_a_small_model_without_a_plan_never_opens_it(self):
+    self.small.plans = False
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 2)), {'small'})
+
+  # -- (d) the large model's first plan must continue the small one's ---------------
+
+  def test_a_first_plan_that_does_not_continue_is_not_published(self):
+    # 3.5 m/s at a stop: the large model's first frames from a reset history,
+    # as measured at the three standstill joins of the drive
+    self.big.vx = 3.5
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    handovers, small_calls = s.handovers, None
+    for _ in range(joining.REJOIN_FRAMES + 3):
+      small_calls = self.small.calls
+      result = self._run(s)
+      if self.big.calls:
+        break
+    self.assertEqual(self.big.calls, 1, 'never tried')
+    # the frame is the small model's, re-run, and modelV2.big never says otherwise
+    self.assertEqual(result['from'], 'small')
+    self.assertEqual(self.small.calls, small_calls + 1)
+    self.assertFalse(s.chestnut)
+    self.assertEqual(s.handovers, handovers + 2, 'modeld forgives the stall of two handovers in one run()')
+    self.assertTrue(s._loading)
+    # the small model missed no frame: its history stays
+    self.reset.assert_not_called()
+    self.assertTrue(self.log.has("first plan mid-drive does not continue the small model's (speed 3.50 m/s",
+                                 'warning'))
+    # said as a reconnect, the live link kept, backed off
+    self._wait_reported(s, 'plan did not continue, reconnecting')
+    self.assertTrue(wait_for(lambda: self.big.client.leave.called))
+    self.assertEqual(self.big.client.leave.call_args.args, (joining.DISCONTINUOUS,))
+    self.assertFalse(self.big.closed)
+    self.assertEqual((s._drops, s._lags), (0, 0), 'neither the cable nor lag')
+    self.assertEqual(s.big_model_state, 'retrying')
+    self.assertEqual(self._run(s)['from'], 'small')
+
+  def test_one_try_per_stop(self):
+    # every try costs modeld the large model's slow first frame: at a stop
+    # where it does not continue, it is not tried again until the car has
+    # set off and stopped again
+    self.big.vx = 3.5
+    with mock.patch.object(joining, 'REJOIN_DELAY_QUICK', 0.01):
+      s = self._windowed()
+      self._proven(s)
+      s.in_control = True
+      self.assertIsNotNone(self._first_try(s))
+      self.assertTrue(s._stop_tried)
+      # the link is back and proven, the stop still held
+      self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+      self._proven(s)
+      self.big.vx = 0.0
+      self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+      self.assertEqual(self.big.calls, 1)
+      # it sets off, and stops again
+      self.small.vx = 5.0
+      self._frames(s, 3)
+      self.assertFalse(s._stop_tried)
+      self.small.vx = 0.0
+      self.assertIsNotNone(self._first_big(s, joining.REJOIN_FRAMES * 2))
+
+  def _first_try(self, s):
+    for i in range(1, joining.REJOIN_FRAMES + 5):
+      self._run(s)
+      if self.big.calls:
+        return i
+    return None
+
+  def test_continuity_is_both_speed_and_lateral_position(self):
+    dv, dy = joining.REJOIN_PLAN_DV, joining.REJOIN_PLAN_DY
+    for big_vx, big_y, kept in ((dv - 0.05, 0.0, True), (dv + 0.05, 0.0, False),
+                                (0.0, dy - 0.05, True), (0.0, -(dy + 0.05), False)):
+      with self.subTest(vx=big_vx, y=big_y):
+        self.small = PlanModel('small')
+        self.big = PlanModel('big', chestnut=True, client=mock.Mock(dead=False), vx=big_vx, y=big_y)
+        s = self._windowed()
+        self._proven(s)
+        s.in_control = True
+        self.assertIsNotNone(self._first_try(s))
+        self.assertEqual(s.chestnut, kept)
+
+  def test_a_first_frame_without_a_plan_is_not_published(self):
+    self.big.plans = False
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    self._first_try(s)
+    self.assertFalse(s.chestnut)
+    self.assertTrue(self.log.has('no plan to compare', 'warning'))
+
+  def test_a_mid_drive_first_frame_that_fails_keeps_the_small_models_history(self):
+    # the one frame it did not run is the one it runs now; a reset would put a
+    # cold small model's plan on the stop (15 m/s for 0.6 s, measured)
+    self.big.raises = RuntimeError('send failed')
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    self._first_try(s)
+    self.assertFalse(s.chestnut)
+    self.assertEqual(s._drops, 1)
+    self.reset.assert_not_called()
+
+  def test_once_it_drives_it_hands_back_as_any_swap_does(self):
+    s = self._windowed()
+    self._proven(s)
+    s.in_control = True
+    self.assertIsNotNone(self._first_big(s, joining.REJOIN_FRAMES + 5))
+    self.assertEqual(self._run(s)['from'], 'big')
+    self.big.raises = RuntimeError('link gone')
+    self.assertEqual(self._run(s)['from'], 'small')
+    self.reset.assert_called_once()
+
+  # -- (e) a link that has not proven itself ----------------------------------------
+
+  def test_a_link_ready_for_less_than_its_proof_is_no_window(self):
+    with mock.patch.object(joining, 'REJOIN_READY_S', 30.0):
+      s = self._windowed()
+      self.assertTrue(wait_for(lambda: s._pings >= joining.REJOIN_PINGS))
+      s.in_control = True
+      self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+      s._ready_at -= 30.0   # as if it had waited out its proof
+      self.assertIsNotNone(self._first_big(s, 5))
+
+  def test_a_link_that_has_not_answered_its_pings_is_no_window(self):
+    with mock.patch.object(joining, 'REJOIN_PING_PERIOD', 30.0):
+      s = self._windowed()
+      time.sleep(joining.REJOIN_READY_S * 2)
+      s.in_control = True
+      self.assertEqual(s._pings, 0)
+      self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+      # answers, but none lately: a host that has stopped answering
+      s._pings, s._pinged_at = joining.REJOIN_PINGS, time.monotonic() - joining.REJOIN_PING_FRESH - 1
+      self.assertEqual(set(self._frames(s, 3)), {'small'})
+      s._pinged_at = time.monotonic()
+      self.assertIsNotNone(self._first_big(s, 5))
+
+  def test_the_keepalive_answers_count_from_the_link_that_waits(self):
+    s = self._windowed()
+    self.assertTrue(wait_for(lambda: s._pings >= 3))
+    client = s._joined[0] if s._joined is not None else None
+    self.assertTrue(client is None or client.ping.call_count >= 3)
+    self.assertLessEqual(time.monotonic() - s._pinged_at, joining.REJOIN_PING_FRESH)
+
+  # -- (f) the ordinary window is not gated twice -----------------------------------
+
+  def test_with_a_window_nothing_in_control_still_swaps_at_once(self):
+    # no count, no proof, no plan rule and no continuity test: nothing is in
+    # control, as on every join of the drive
+    self.held = False
+    self.small.vx, self.big.vx = 20.0, 3.5
+    s = self._windowed()
+    s.in_control = False
+    self.assertEqual(self._run(s)['from'], 'big')
+    self.assertTrue(s.chestnut)
+    self.assertEqual(self.asked, 0)
+    self.assertFalse(self.log.has('swapping the large model in mid-drive'))
+
+
 class AnyForkTest(OpenpilotTest):
   """Every fork's small model joins through join(), swaps and hands back, and
   its history is zeroed after, in the buffers its own JIT is linked to."""
@@ -1481,6 +1847,31 @@ class AnyForkTest(OpenpilotTest):
     self.hand_back(fakes.starpilot()[0], [])
     self.parts.warps.load.assert_called_once_with(1928, 1208, *geometry[2:])
     self.assertIs(joining.JetlinkModelState.call_args.args[2], warp.Warp.return_value)
+
+  def test_without_the_adapters_window_a_stop_in_control_never_swaps(self):
+    # the regression guard through join(): the adapter's in_control() says
+    # True (MADS) and it has no mid_drive_window, as every adapter today
+    self.op.engaged = True
+    s = joining.join(self.parts, 1928, 1208, fakes.starpilot()[0])
+    self.addCleanup(JoiningBase._close, s)
+    self.assertTrue(wait_for(lambda: s._joined is not None))
+    self.assertIsNone(s._ask_rejoin)
+    self.assertEqual({s.run({}, {}, {})['from'] for _ in range(100)}, {'small'})
+    self.assertEqual(self.big.calls, 0)
+    self.op.engaged = False
+    self.assertEqual(s.run({}, {}, {}), {'from': 'big'})
+
+  def test_the_adapters_window_reaches_the_joining_model(self):
+    window, asked = mock.Mock(return_value=False), []
+    self.op.mid_drive_window = lambda: asked.append(1) or window
+    self.assertEqual(jo.conformance(self.op, jo.Openpilot), [], 'an optional member, held to its signature')
+    s = joining.join(self.parts, 1928, 1208, fakes.starpilot()[0])
+    self.addCleanup(JoiningBase._close, s)
+    self.assertEqual(asked, [1], 'asked once, at the join')
+    self.assertIs(s._ask_rejoin, window)
+    self.op.mid_drive_window = lambda small: window
+    self.assertEqual(jo.conformance(self.op, jo.Openpilot),
+                     ['mid_drive_window(small): expected mid_drive_window()'])
 
   def test_a_warp_that_is_not_one_keeps_the_small_model(self):
     self.op.model_warp = mock.Mock(return_value=SimpleNamespace(start=lambda frame: None))
