@@ -51,7 +51,7 @@ from collections import deque
 
 from jetlink import protocol as P
 from jetlink.comma import gadget
-from jetlink.openpilot.model_state import JetlinkModelState
+from jetlink.openpilot.model_state import HOLD_WINDOW, JetlinkModelState
 from jetlink.transport.priority import background_thread
 
 # after a join fails or the large model dies mid-drive. Long enough not to
@@ -140,6 +140,15 @@ WARM_QUIET = 20
 # large model's own wait is held to HOLD_FRAME from its warp's start whatever
 # the small model costs; this catches a small model that ran past it
 WARM_FRAME_BUDGET = 0.046
+# the most warm frames in any model_state.HOLD_WINDOW (10 s), counted across
+# warm-ups. The small model and the link's frame on one frame is the load that
+# took the driver monitoring model to ~16 Hz and selfdrived's commIssueAvgFreq
+# (d790583), and selfdrived judges that rate over 10 s. A host that holds one
+# frame in 10 to 40 never hands back, yet keeps one warm-up going or starts
+# another within WARM_QUIET most frames. Full, the warm-up ends as WARM_QUIET
+# ends it (the next hand-back resets, as without it) and none starts until the
+# window has room: at most 30 % of the frames in it
+WARM_MAX = 60
 # the small model's frames from its reset a hand-back logs the plan of: the
 # reset block (the model's image pair is a frame and the one 4 before it)
 WARM_LOGGED = 4
@@ -283,6 +292,8 @@ class JoiningModelState:
     self._last_points: deque = deque(maxlen=WARM_LOGGED)
     self._warm_ms = [0.0, 0.0, 0.0, 0.0]
     self._reset_s = 0.0
+    # when the warm frames in the last HOLD_WINDOW ran (WARM_MAX)
+    self._warm_times: deque = deque()
     if warm_handback and reset_small is None:
       log.warning("jetlink: no reset of the small model to warm it from; every hand-back starts it cold")
 
@@ -510,6 +521,7 @@ class JoiningModelState:
       self._warm_stop('its warm run failed')
       return None
     self._warm += 1
+    self._warm_times.append(time.monotonic())
     point = plan_point(out)
     if len(self._first_points) < WARM_LOGGED:
       self._first_points.append(point)
@@ -542,6 +554,15 @@ class JoiningModelState:
     """After a frame the large model drove: a held frame starts the warm-up,
     from the next frame; WARM_QUIET frames answered in time end it."""
     self._big_point = plan_point(result)
+    now, times = time.monotonic(), self._warm_times
+    while times and now - times[0] > HOLD_WINDOW:
+      times.popleft()
+    if len(times) >= WARM_MAX:
+      if self._warming:
+        self._log.warning("jetlink: the small model stops warming: %d warm frames in %.0f s, the most it may run",
+                          len(times), HOLD_WINDOW)
+        self._warming, self._warm, self._quiet = False, 0, 0
+      return
     if getattr(big, 'held', False):
       self._quiet = 0
       if not self._warming and self._warm_off is None:
