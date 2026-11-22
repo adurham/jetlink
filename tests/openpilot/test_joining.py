@@ -11,7 +11,9 @@ is pinned: modeld gets a working model immediately, a swap never lands on an
 engaged frame, a large model that dies mid-drive falls back without losing the
 frame, and a small-model failure still belongs to modeld.
 """
+import contextlib
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -1420,10 +1422,60 @@ class PlanModel(FakeModel):
     self.plans = True
 
   def run(self, bufs, transforms, inputs, after_enqueue=None):
+    if (order := getattr(self, 'order', None)) is not None:
+      # the frames in the order they ran (a list shared with the other model)
+      order.append(f'{self.name} run')
     out = super().run(bufs, transforms, inputs, after_enqueue)
     if self.plans:
       out['plan'] = plan(self.vx, self.y)
     return out
+
+
+class WarmingModel(PlanModel):
+  """A large model whose plan settles as its history fills, as a phone's
+  does after a reset: its (k+1)th frame plans `speeds[k]` m/s, the last one
+  kept after, and is held (model_state's late reply, no answer of its own)
+  where k is in `held_at`."""
+
+  def __init__(self, speeds, held_at=()):
+    super().__init__('big', chestnut=True, client=mock.Mock(dead=False))
+    self.speeds, self.held_at = list(speeds), set(held_at)
+    self.held = False
+
+  def run(self, bufs, transforms, inputs, after_enqueue=None):
+    self.vx = self.speeds[min(self.calls, len(self.speeds) - 1)]
+    self.held = self.calls in self.held_at
+    return super().run(bufs, transforms, inputs, after_enqueue)
+
+
+class SplitModel(WarmingModel):
+  """...whose frame is split as a JetlinkModelState's is: prepare() and
+  send() put it on the link, end() collects the answer. Its calls go in
+  `steps`; end() raises `fails` on its frame `fails_at` (0-based)."""
+
+  def __init__(self, speeds, steps, held_at=()):
+    super().__init__(speeds, held_at)
+    self.steps = steps
+    self.fails, self.fails_at, self.ended_with = None, None, []
+
+  def prepare(self, bufs, transforms, inputs):
+    self.steps.append('big prepare')
+
+  def send(self, want_telemetry=False):
+    self.steps.append('big send')
+
+  def end(self, after_enqueue=None):
+    self.steps.append('big end')
+    self.ended_with.append(after_enqueue)
+    if self.fails is not None and self.calls == self.fails_at:
+      self.calls += 1
+      raise self.fails
+    return WarmingModel.run(self, {}, {}, {}, after_enqueue)
+
+  def run(self, bufs, transforms, inputs, after_enqueue=None):
+    self.prepare(bufs, transforms, inputs)
+    self.send(after_enqueue is not None)
+    return self.end(after_enqueue)
 
 
 class MidDriveTest(JoiningBase):
@@ -1615,28 +1667,24 @@ class MidDriveTest(JoiningBase):
 
   def test_a_first_plan_that_does_not_continue_is_not_published(self):
     # 3.5 m/s at a stop: the large model's first frames from a reset history,
-    # as measured at the three standstill joins of the drive
+    # as measured at the three standstill joins of the drive. Held, none of
+    # them is published, and one that never continues is let go
     self.big.vx = 3.5
     s = self._windowed()
     self._proven(s)
     s.in_control = True
-    handovers, small_calls = s.handovers, None
-    for _ in range(joining.REJOIN_FRAMES + 3):
-      small_calls = self.small.calls
-      result = self._run(s)
-      if self.big.calls:
-        break
-    self.assertEqual(self.big.calls, 1, 'never tried')
-    # the frame is the small model's, re-run, and modelV2.big never says otherwise
-    self.assertEqual(result['from'], 'small')
-    self.assertEqual(self.small.calls, small_calls + 1)
+    handovers = s.handovers
+    results = self._hold(s)
+    self.assertEqual(self.big.calls, joining.REJOIN_HOLD_FRAMES, 'held for its answers, then let go')
+    # every frame of the hold is the small model's, run once, and modelV2.big never says otherwise
+    self.assertEqual([r['from'] for r in results], ['small'] * joining.REJOIN_HOLD_FRAMES)
     self.assertFalse(s.chestnut)
-    self.assertEqual(s.handovers, handovers + 2, 'modeld forgives the stall of two handovers in one run()')
+    self.assertEqual(s.handovers, handovers + 2, "the hold's first frame and its end: modeld forgives both")
     self.assertTrue(s._loading)
     # the small model missed no frame: its history stays
     self.reset.assert_not_called()
-    self.assertTrue(self.log.has("first plan mid-drive does not continue the small model's (speed 3.50 m/s",
-                                 'warning'))
+    self.assertTrue(self.log.has(f"does not continue the small model's in {joining.REJOIN_HOLD_FRAMES} answers "
+                                 "(speed 3.50 m/s", 'warning'))
     # said as a reconnect, the live link kept, backed off
     self._wait_reported(s, 'plan did not continue, reconnecting')
     self.assertTrue(wait_for(lambda: self.big.client.leave.called))
@@ -1645,6 +1693,7 @@ class MidDriveTest(JoiningBase):
     self.assertEqual((s._drops, s._lags), (0, 0), 'neither the cable nor lag')
     self.assertEqual(s.big_model_state, 'retrying')
     self.assertEqual(self._run(s)['from'], 'small')
+    self.assertEqual(self.big.calls, joining.REJOIN_HOLD_FRAMES)
 
   def test_one_try_per_stop(self):
     # every try costs modeld the large model's slow first frame: at a stop
@@ -1655,14 +1704,15 @@ class MidDriveTest(JoiningBase):
       s = self._windowed()
       self._proven(s)
       s.in_control = True
-      self.assertIsNotNone(self._first_try(s))
+      self._hold(s)
       self.assertTrue(s._stop_tried)
+      self.assertFalse(s._holding)
       # the link is back and proven, the stop still held
       self.assertTrue(wait_for(lambda: s._joined is not None, 5))
       self._proven(s)
       self.big.vx = 0.0
       self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
-      self.assertEqual(self.big.calls, 1)
+      self.assertEqual(self.big.calls, joining.REJOIN_HOLD_FRAMES)
       # it sets off, and stops again
       self.small.vx = 5.0
       self._frames(s, 3)
@@ -1676,6 +1726,21 @@ class MidDriveTest(JoiningBase):
       if self.big.calls:
         return i
     return None
+
+  def _hold(self, s):
+    """Frames until the window opens, then the hold's frames until it is
+    over: what each frame of the hold published. The small model runs every
+    one of them, the one the large model takes over on included."""
+    results = []
+    for _ in range(joining.REJOIN_FRAMES + 5 + joining.REJOIN_HOLD_FRAMES + 5):
+      before = self.small.calls
+      result = self._run(s)
+      self.assertEqual(self.small.calls, before + 1, 'a frame the small model did not run')
+      if self.big.calls:
+        results.append(result)
+        if not s._holding:
+          return results
+    self.fail('the window never opened' if not self.big.calls else 'the hold never ended')
 
   def test_continuity_is_both_speed_and_lateral_position(self):
     dv, dy = joining.REJOIN_PLAN_DV, joining.REJOIN_PLAN_DY
@@ -1765,6 +1830,203 @@ class MidDriveTest(JoiningBase):
     self.assertTrue(s.chestnut)
     self.assertEqual(self.asked, 0)
     self.assertFalse(self.log.has('swapping the large model in mid-drive'))
+
+  # -- (g) the hold: unpublished until its plan continues the small model's ----------
+
+  def _held(self, big, window=None):
+    """A proven link at a held stop with MADS in control, and `big` to swap in."""
+    self.big = big
+    s = self._windowed(window)
+    self._proven(s)
+    s.in_control = True
+    return s
+
+  def test_held_then_published_on_the_answer_that_continues(self):
+    # the drive's standstill joins: four answers from the reset history at
+    # 3.5 m/s, then one with real history that continues the stop
+    n = joining.REJOIN_HOLD_FRAMES
+    s = self._held(WarmingModel([3.5] * (n - 1) + [0.2]))
+    handovers = s.handovers
+    results = self._hold(s)
+    self.assertEqual([r['from'] for r in results], ['small'] * (n - 1) + ['big'])
+    self.assertEqual(self.big.calls, n)
+    self.assertTrue(s.chestnut)
+    self.assertEqual(s.big_model_state, 'running')
+    self.assertEqual(s.handovers, handovers + 2, 'the hold started, then it took over')
+    self.reset.assert_not_called()
+    self.assertTrue(self.log.has(f'held frame 1, answer 1 of at most {n}: speed 3.50 m/s and lateral position 0.00 m '
+                                 'off, does not continue', 'warning'))
+    self.assertTrue(self.log.has(f'held frame {n}, answer {n} of at most {n}: speed 0.20 m/s', 'warning'))
+    self.assertTrue(self.log.has(f'takes over mid-drive on held frame {n}', 'warning'))
+    self.assertTrue(self.log.has('large model joined mid-drive, modelV2.big is now true', 'warning'))
+    # from here it drives alone, as after any swap
+    small_calls = self.small.calls
+    self.assertEqual(self._frames(s, 5), ['big'] * 5)
+    self.assertEqual(self.small.calls, small_calls)
+
+  def test_refused_when_none_of_its_answers_continue(self):
+    # the answer after the last it may give would have continued: never asked for
+    n = joining.REJOIN_HOLD_FRAMES
+    with mock.patch.object(joining, 'REJOIN_DELAY_QUICK', 0.01):
+      s = self._held(WarmingModel([3.5] * n + [0.0]))
+      results = self._hold(s)
+      self.assertEqual([r['from'] for r in results], ['small'] * n)
+      self.assertEqual(self.big.calls, n)
+      self.assertFalse(s.chestnut)
+      self.assertTrue(s._stop_tried)
+      self.reset.assert_not_called()
+      self._wait_reported(s, 'plan did not continue, reconnecting')
+      # the link comes back, proven, at the same stop: no second try
+      self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+      self._proven(s)
+      self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+      self.assertEqual(self.big.calls, n)
+
+  def test_a_plan_that_continues_on_its_first_answer_is_published_at_once(self):
+    # no needless hold: the frame the window opens on is the large model's
+    s = self._held(WarmingModel([0.0]))
+    handovers = s.handovers
+    results = self._hold(s)
+    self.assertEqual([r['from'] for r in results], ['big'])
+    self.assertEqual(self.big.calls, 1)
+    self.assertTrue(s.chestnut)
+    self.assertEqual(s.handovers, handovers + 1, 'one swap, on one frame')
+    self.assertTrue(self.log.has('takes over mid-drive on held frame 1', 'warning'))
+    self.assertEqual(self._run(s)['from'], 'big')
+
+  def test_without_a_window_nothing_is_ever_held(self):
+    # the ordinary window as it was: the large model's first frame goes out
+    # at once, however far its plan is from the small model's, and the small
+    # model does not run on it
+    self.big = WarmingModel([3.5])
+    s = self._make(self.small, self._connect, self._build, reset_small=self.reset)
+    self.addCleanup(self._close, s)
+    self._wait_joined(s)
+    s.in_control = True
+    self.assertEqual(set(self._frames(s, 100)), {'small'})
+    s.in_control = False
+    small_calls, handovers = self.small.calls, s.handovers
+    self.assertEqual(self._run(s)['from'], 'big')
+    self.assertEqual(self.small.calls, small_calls)
+    self.assertEqual(s.handovers, handovers + 1)
+    self.assertEqual((s._held_frames, s._holding), (0, False))
+    self.assertFalse(self.log.has('held frame'))
+
+  def test_a_hold_the_window_shuts_on_is_let_go_and_is_the_stops_try(self):
+    with mock.patch.object(joining, 'REJOIN_DELAY_QUICK', 0.01):
+      s = self._held(WarmingModel([3.5] * 10))
+      self._first_try(s)
+      self.assertEqual(self._run(s)['from'], 'small')
+      self.held = False   # the driver's foot on the gas
+      self.assertEqual(self._run(s)['from'], 'small')
+      self.assertFalse(s._holding)
+      self.assertEqual(self.big.calls, 3)
+      self.assertTrue(self.log.has('the window shut on held frame 3, 2 answers in', 'warning'))
+      self.held = True
+      self._wait_reported(s, 'plan did not continue, reconnecting')
+      self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+      self._proven(s)
+      self.assertEqual(set(self._frames(s, joining.REJOIN_FRAMES * 3)), {'small'})
+      self.assertEqual(self.big.calls, 3)
+      self.reset.assert_not_called()
+
+  def test_a_small_plan_that_sets_off_in_the_hold_ends_it(self):
+    s = self._held(WarmingModel([3.5] * 10))
+    self._first_try(s)
+    self.small.vx = joining.REJOIN_PLAN_SPEED + 0.1   # the lead goes
+    self.assertEqual(self._run(s)['from'], 'small')
+    self.assertFalse(s._holding)
+    self.assertFalse(s.chestnut)
+    # a car that set off has ended the stop: the next one gets its try
+    self.assertFalse(s._stop_tried)
+
+  def test_nothing_in_control_in_the_hold_swaps_at_once(self):
+    # the ordinary window opens: no rule to keep, as on every join of the drive
+    s = self._held(WarmingModel([3.5] * 10))
+    handovers = s.handovers
+    self._first_try(s)
+    s.in_control = False
+    self.assertEqual(self._run(s)['from'], 'big')
+    self.assertTrue(s.chestnut)
+    self.assertEqual(s.handovers, handovers + 2)
+
+  def test_the_large_models_frame_goes_out_before_the_small_model_runs(self):
+    # the host works on its frame through the small model's run, and only
+    # the small model's frame is published, after_enqueue and all
+    steps = []
+    self.small.order = steps
+    s = self._held(SplitModel([3.5, 0.0], steps))
+    self._first_try(s)
+    self.assertEqual(steps[-4:], ['big prepare', 'big send', 'small run', 'big end'])
+    after_enqueue = mock.Mock()
+    del steps[:]
+    self.assertEqual(s.run({}, {}, {}, after_enqueue)['from'], 'big')
+    self.assertEqual(steps, ['big prepare', 'big send', 'small run', 'big end'])
+    after_enqueue.assert_called_once_with()
+    self.assertEqual(self.big.ended_with, [None, None], 'the held frames are not modeld\'s to publish')
+    # driving, it runs alone
+    del steps[:]
+    self.assertEqual(self._run(s)['from'], 'big')
+    self.assertEqual(steps, ['big prepare', 'big send', 'big end'])
+
+  def test_a_frame_the_large_model_holds_is_neither_compared_nor_counted(self):
+    # a late reply publishes the frame before it: nothing new of its plan,
+    # here one that would have continued
+    n = joining.REJOIN_HOLD_FRAMES
+    s = self._held(WarmingModel([3.5, 0.0, 0.0] + [3.5] * 10, held_at=(1, 2)))
+    results = self._hold(s)
+    self.assertEqual([r['from'] for r in results], ['small'] * (n + 2))
+    self.assertEqual(self.big.calls, n + 2)
+    self.assertEqual(s._answers, n)
+    self.assertTrue(self.log.has('held frame 2: no answer of its own yet', 'warning'))
+
+  def test_a_large_model_behind_in_the_hold_is_let_go_as_lag(self):
+    s = self._held(WarmingModel([3.5] * 10))
+    self._first_try(s)
+    self.big.behind = 'held frame 4 of the first 20'
+    self.assertEqual(self._run(s)['from'], 'small')
+    self.assertFalse(s._holding)
+    self.assertFalse(s.chestnut)
+    self.assertEqual((s._lags, s._drops), (1, 0))
+    self.assertTrue(s._stop_tried)
+    self.reset.assert_not_called()
+    self._wait_reported(s, 'fell behind, reconnecting')
+
+  def test_a_held_model_that_fails_keeps_the_small_models_history_and_frame(self):
+    steps = []
+    s = self._held(SplitModel([3.5] * 10, steps))
+    self.big.fails, self.big.fails_at = RuntimeError('no answer for frame in 0.2s; link abandoned'), 2
+    self._first_try(s)
+    self.assertEqual(self._run(s)['from'], 'small')
+    after_enqueue = mock.Mock()
+    self.assertEqual(s.run({}, {}, {}, after_enqueue)['from'], 'small', "the small model's frame, already run")
+    after_enqueue.assert_called_once_with()
+    self.assertFalse(s._holding)
+    self.assertEqual((s._drops, s._lags), (1, 0))
+    self.reset.assert_not_called()
+    self.assertTrue(self.log.has('large model failed while it was held mid-drive', 'exception'))
+
+  def test_the_first_frame_it_runs_alone_after_taking_over_keeps_the_small_models_history(self):
+    s = self._held(WarmingModel([3.5, 0.0]))
+    results = self._hold(s)
+    self.assertEqual(results[-1]['from'], 'big')
+    # the small model ran up to the take-over; it runs the frame that fails now
+    self.big.raises = RuntimeError('send failed')
+    self.assertEqual(self._run(s)['from'], 'small')
+    self.reset.assert_not_called()
+
+  def test_the_state_says_joining_while_it_is_held(self):
+    s = self._held(WarmingModel([3.5] * 10))
+    s._failures = 1   # after a fallback, as every mid-drive window is: 'retrying' until a link lands
+    self.assertEqual(s.big_model_state, 'ready')
+    self._first_try(s)
+    self.assertEqual(s.big_model_state, 'joining')
+    self.assertFalse(s.chestnut)
+    record = s._runtime(0, {}, {}, False)
+    self.assertEqual((record['state'], record['active']), ('joining', False))
+    for _ in range(joining.REJOIN_HOLD_FRAMES):
+      self._run(s)
+    self.assertEqual(s.big_model_state, 'retrying')
 
 
 class AnyForkTest(OpenpilotTest):
@@ -1873,6 +2135,19 @@ class AnyForkTest(OpenpilotTest):
     self.op.mid_drive_window = lambda small: window
     self.assertEqual(jo.conformance(self.op, jo.Openpilot),
                      ['mid_drive_window(small): expected mid_drive_window()'])
+
+  def test_both_adapter_switches_reach_the_joining_model(self):
+    # the merge of the warm hand-back and the mid-drive window: each asked
+    # once at the join, each optional, both on together
+    window, asked = mock.Mock(return_value=False), []
+    self.op.warm_handback = lambda: asked.append('warm') or True
+    self.op.mid_drive_window = lambda: asked.append('window') or window
+    self.assertEqual(jo.conformance(self.op, jo.Openpilot), [])
+    s = joining.join(self.parts, 1928, 1208, fakes.starpilot()[0])
+    self.addCleanup(JoiningBase._close, s)
+    self.assertEqual(sorted(asked), ['warm', 'window'])
+    self.assertTrue(s._warm_handback)
+    self.assertIs(s._ask_rejoin, window)
 
   def test_a_warp_that_is_not_one_keeps_the_small_model(self):
     self.op.model_warp = mock.Mock(return_value=SimpleNamespace(start=lambda frame: None))
@@ -2386,6 +2661,591 @@ class WarmHandbackTest(JoiningBase):
       src = inspect.getsource(fn)
       for name in ('_warming', '_warm ', '_warm=', '_quiet', '_cold', '_first_points', '_last_points', '_warm_off'):
         self.assertNotIn(name, src, f'{fn.__name__} touches {name}')
+
+
+# -- both: the warm hand-back (6a40fe4) and the mid-drive window (36600e0) ------
+
+def tip_module(test, sha):
+  """jetlink/openpilot/joining.py as committed at `sha`, loaded as a module of
+  its own; the test is skipped in a clone without it."""
+  import importlib.util
+  import subprocess
+  src = subprocess.run(['git', 'show', f'{sha}:jetlink/openpilot/joining.py'], capture_output=True, text=True,
+                       cwd=Path(__file__).resolve().parents[2])
+  if src.returncode != 0:
+    test.skipTest(f'{sha} is not in this clone')
+  spec = importlib.util.spec_from_loader(f'joining_{sha}', loader=None)
+  module = importlib.util.module_from_spec(spec)
+  module.__file__ = joining.__file__
+  exec(compile(src.stdout, f'joining_{sha}.py', 'exec'), module.__dict__)
+  return module
+
+
+# a frame's timings in the log, which no two runs share: N
+TIMINGS = re.compile(r'\d+(?:\.\d+)?(?= ms\b)|\d+\.\d+(?=,)')
+# and the lines that are all timing, or the join thread's backoff
+UNTIMED = ('next attempt in', 'built the large model state in', 'fallback frame')
+
+
+def _framed(level):
+  record = getattr(RecordingLog, level)
+
+  def log(self, msg, *args, **kwargs):
+    record(self, msg, *args, **kwargs)
+    if threading.get_ident() == self.frame_thread:
+      try:
+        text = str(msg) % args if args else str(msg)
+      except (TypeError, ValueError):
+        text = f"{msg} {args}"
+      if not any(x in text for x in UNTIMED):
+        self.framed.append((level, TIMINGS.sub('N', text)))
+  return log
+
+
+class FrameLog(RecordingLog):
+  """RecordingLog, and apart the lines the frame thread (the test's own)
+  logged, in order and without their timings: what two runs of one drive
+  through two versions of the code can be compared on. The join and writer
+  threads' lines land in no fixed order against the frames'."""
+  debug, info, warning, error, exception, critical = map(_framed, ('debug', 'info', 'warning', 'error', 'exception',
+                                                                   'critical'))
+
+  def __init__(self):
+    super().__init__()
+    self.frame_thread = threading.get_ident()
+    self.framed: list[tuple[str, str]] = []
+
+
+class PlanLinkModel(LinkModel):
+  """LinkModel, whose (k+1)th frame plans `speeds[k]` m/s, the last one kept
+  after (WarmingModel's rule): a hold through the mid-drive window compares
+  its plans with the small model's."""
+
+  def __init__(self, steps, speeds=(0.0,), held_at=()):
+    super().__init__(steps, held_at)
+    self.speeds = list(speeds)
+
+  def end(self, after_enqueue=None):
+    k = self.calls
+    out = super().end(after_enqueue)
+    out['plan'] = plan_array(self.speeds[min(k, len(self.speeds) - 1)])
+    return out
+
+
+class TipsTest(JoiningBase):
+  """Each feature with the other off is its own branch's code, call for call:
+  the same drive through the merge and through the tip it came from gives the
+  same model calls in the same order, the same published frames, the same
+  frame-thread log, handovers and small-model resets."""
+
+  def _warm_trace(self, module):
+    steps = []
+    small, big = HistoryModel(steps), LinkModel(steps)
+    log = FrameLog()
+    outs = []
+    names = (('SMALL_WARMUP_FRAMES', 0), ('REJOIN_DELAY_QUICK', 0.01), ('REJOIN_DELAY', 0.01),
+             # a stall of the test machine is not a warm run past its budget
+             ('WARM_FRAME_BUDGET', 10.0))
+    with contextlib.ExitStack() as stack:
+      for name, value in names:
+        stack.enter_context(mock.patch.object(module, name, value))
+      s = module.JoiningModelState(small, self._connect, lambda c, sp: big, reset_small=small.reset,
+                                   progress=mock.Mock(), log=log, warm_handback=True)
+      frame = lost = 0
+
+      def run(n):
+        nonlocal frame
+        for _ in range(n):
+          frame += 1
+          outs.append(s.run({}, {}, {'frame': frame, 'vx': 5.0}))
+
+      def rejoined():
+        self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+
+      def lag(n_held=model_state.HOLDS_IN_A_ROW):
+        big.held_at = set(range(big.calls, big.calls + n_held))
+        run(n_held - 1)
+        big.behind = f'held {n_held} frames in a row'
+        run(1)
+        big.behind = None
+
+      try:
+        rejoined()
+        s.in_control = False
+        run(8)                       # swapped in, answering
+        big.held_at = {big.calls}    # one held: warm from the next
+        run(4)
+        lag()                        # a lag hand-back, warm: not reset
+        run(6)                       # the small model's, recorded
+        rejoined()
+        run(3)                       # swapped in again
+        big.held_at = {big.calls, big.calls + 1, big.calls + 2}
+        run(3)
+        big.fails, big.fails_at = RuntimeError('no answer for frame in 0.2s'), big.calls
+        lost = frame + 1
+        run(5)                       # lost in end(): the warm run is the frame's
+        rejoined()
+        run(2)
+        big.held_at = {big.calls}
+        run(2)
+        big.fails, big.fails_at, big.fails_on_send = LinkError('no answer to 4 frames'), big.calls, True
+        run(5)                       # lost in send(): the frame run published, not reset
+        big.fails_on_send = False
+        rejoined()
+        run(2)
+        big.held_at = {big.calls}
+        run(1)
+        small.raises = RuntimeError('small model fault')
+        run(1)                       # a warm run that fails: off for the swap
+        small.raises = None
+        lag()
+        run(5)                       # cold, reset; the record says why
+        rejoined()
+        run(2)
+        big.held_at = {big.calls}
+        run(module.WARM_QUIET + 3)   # answered in time: the warm-up ends
+        big.fails, big.fails_at = RuntimeError('link gone'), big.calls
+        run(5)                       # cold again
+      finally:
+        s.close()
+        s._thread.join(5)
+    return steps, [(o.get('from'), o.get('frame')) for o in outs], log.framed, s.handovers, small.resets, lost
+
+  def test_warm_on_without_a_window_is_6a40fe4_call_for_call(self):
+    tip = tip_module(self, '6a40fe4')
+    self.assertFalse(hasattr(tip, 'REJOIN_HOLD_FRAMES'))
+    before, after = self._warm_trace(tip), self._warm_trace(joining)
+    self.assertEqual(before[0], after[0], 'the calls differ')
+    self.assertEqual(before[1], after[1], 'the published frames differ')
+    self.assertEqual(before[2], after[2], 'the log differs')
+    self.assertEqual(before[3:], after[3:], 'the handovers or the resets differ')
+    # and the drive is the one the test means: warm and cold hand-backs, a warm run published
+    lines = [text for _, text in after[2]]
+    records = [x for x in lines if 'hand-back record' in x]
+    self.assertEqual([('warm, not reset' in x, 'cold, reset' in x) for x in records],
+                     [(True, False)] * 3 + [(False, True)] * 2, records)
+    self.assertIn('cold, reset at the hand-back (warm-up off: its warm run failed)', records[3])
+    self.assertTrue(any('stops warming after' in x for x in lines))
+    lost = after[5]
+    self.assertEqual(after[1][lost - 1], ('small', lost), "the lost frame's own warm run, published")
+    self.assertEqual(after[0].count(f'small run {lost}'), 1, 'and not run twice')
+    self.assertLess(after[0].index(f'small run {lost}'), after[0].index(f'big end {lost}'))
+
+  def _window_trace(self, module):
+    steps = []
+    small = PlanModel('small')
+    small.order = steps
+    big = SplitModel([3.5], steps)
+    held = [True]
+    log = FrameLog()
+    outs = []
+    reset = mock.Mock(side_effect=lambda: steps.append('small reset'))
+    names = (('SMALL_WARMUP_FRAMES', 0), ('REJOIN_DELAY_QUICK', 0.01), ('REJOIN_DELAY', 0.01),
+             ('REJOIN_READY_S', 0.0), ('REJOIN_PING_PERIOD', 30.0))
+    with contextlib.ExitStack() as stack:
+      for name, value in names:
+        stack.enter_context(mock.patch.object(module, name, value))
+      s = module.JoiningModelState(small, self._connect, lambda c, sp: big, reset_small=reset,
+                                   progress=mock.Mock(), log=log, rejoin=lambda: held[0])
+
+      def run(n):
+        for _ in range(n):
+          outs.append(s.run({}, {}, {})['from'])
+
+      def proven():
+        # the link back and its keepalive answered: no ping takes it out under a frame
+        self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+        s._pings, s._pinged_at = module.REJOIN_PINGS, time.monotonic()
+
+      def plans(*speeds):
+        # the large model's next answers, from its next frame
+        big.speeds = [3.5] * big.calls + list(speeds)
+
+      def set_off_and_stop():
+        small.vx = 5.0
+        run(3)
+        small.vx = 0.0
+
+      def until_hold():
+        # the link proven again, then frames until the window opens and the
+        # hold's first frame has run
+        proven()
+        calls = big.calls
+        for _ in range(module.REJOIN_FRAMES * 3):
+          run(1)
+          if big.calls > calls:
+            return
+        self.fail('the window never opened')
+
+      try:
+        proven()
+        s.in_control = True          # MADS, the whole drive
+        plans(3.5)
+        until_hold()
+        run(module.REJOIN_HOLD_FRAMES + 2)   # never continues: let go
+        proven()
+        run(module.REJOIN_FRAMES * 2)        # the same stop: no second try
+        set_off_and_stop()
+        plans(3.5, 0.2)
+        until_hold()
+        run(1)                       # continues on its second answer: takes over
+        run(3)
+        big.fails, big.fails_at = RuntimeError('link gone'), big.calls
+        run(2)                       # lost, not on its first frame alone: reset
+        set_off_and_stop()
+        plans(0.0)
+        until_hold()                 # continues at once
+        big.fails, big.fails_at = RuntimeError('send failed'), big.calls
+        run(2)                       # its first frame alone fails: not reset
+        set_off_and_stop()
+        plans(3.5)
+        big.held_at = {big.calls + 1}
+        until_hold()
+        run(2)                       # a held frame, then an answer
+        held[0] = False              # the window shuts in the hold: let go
+        run(1)
+        held[0] = True
+        run(2)
+        set_off_and_stop()
+        plans(3.5)
+        until_hold()
+        s.in_control = False         # nothing in control in the hold: at once
+        run(3)
+        big.behind = 'held 5 frames in a row'
+        run(1)
+        big.behind = None
+        run(2)                       # a lag hand-back: reset
+        proven()
+        run(2)                       # nothing in control: the ordinary swap
+      finally:
+        s.close()
+        s._thread.join(5)
+    return steps, outs, log.framed, s.handovers, reset.call_count, (s._drops, s._lags)
+
+  def test_a_window_without_the_warm_up_is_36600e0_call_for_call(self):
+    tip = tip_module(self, '36600e0')
+    self.assertFalse(hasattr(tip, 'WARM_QUIET'))
+    before, after = self._window_trace(tip), self._window_trace(joining)
+    self.assertEqual(before[0], after[0], 'the calls differ')
+    self.assertEqual(before[1], after[1], 'the published frames differ')
+    self.assertEqual(before[2], after[2], 'the log differs')
+    self.assertEqual(before[3:], after[3:], 'the handovers, resets or counts differ')
+    lines = [text for _, text in after[2]]
+    self.assertEqual(sum('takes over mid-drive' in x for x in lines), 3, lines)
+    self.assertEqual(sum('swapping the large model in mid-drive' in x for x in lines), 5, lines)
+    self.assertTrue(any('the window shut on held frame' in x for x in lines))
+    self.assertTrue(any('no answer of its own yet' in x for x in lines))
+    self.assertEqual(after[4], 2, 'reset at the two hand-backs that were not its first frame alone')
+
+
+class WarmAndWindowTest(JoiningBase):
+  """The warm hand-back and the mid-drive window on together. The window's
+  hold runs no warm frame: the small model drives it, published, once a frame,
+  and its history is whole at the take-over. The warm-up starts only once
+  the large model drives, and its first frame alone after a mid-drive
+  take-over, the one frame the small model did not run, never resets the
+  small model, warm or not. The warm runs nobody publishes are never read as
+  the small model's plan."""
+
+  def setUp(self):
+    super().setUp()
+    # a link proven at once, and no keepalive under a frame; a stall of the
+    # test machine is not a warm run past its budget
+    for name, value in (('REJOIN_PING_PERIOD', 30.0), ('REJOIN_READY_S', 0.0), ('REJOIN_DELAY_QUICK', 0.01),
+                        ('WARM_FRAME_BUDGET', 10.0)):
+      p = mock.patch.object(joining, name, value)
+      p.start()
+      self.addCleanup(p.stop)
+    self.steps = []
+    self.small = HistoryModel(self.steps)
+    self.big = PlanLinkModel(self.steps)
+    self.frame_no = 0
+    # the car's speed, which the small model past its cold start plans
+    self.vx = 0.0
+    self.held = True
+
+  def _state(self, warm=True):
+    s = self._make(self.small, self._connect, self._build, reset_small=self.small.reset, warm_handback=warm,
+                   rejoin=lambda: self.held)
+    self.addCleanup(self._close, s)
+    self._wait_joined(s)
+    return s
+
+  def _proven(self, s):
+    self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+    s._pings, s._pinged_at = joining.REJOIN_PINGS, time.monotonic()
+
+  def _frame(self, s, after_enqueue=None):
+    self.frame_no += 1
+    return s.run({}, {}, {'frame': self.frame_no, 'vx': self.vx}, after_enqueue)
+
+  def _drive(self, s, n):
+    return [self._frame(s) for _ in range(n)]
+
+  def _at_a_stop(self, s):
+    """MADS in control at a held stop, the small model past its cold start
+    (16 m/s is no stop), and the link proven: the window may open."""
+    s.in_control = True
+    self._drive(s, HistoryModel.COLD + 1)
+    self._proven(s)
+
+  def _hold(self, s):
+    """Frames until the hold's first: its output and steps."""
+    calls = self.big.calls
+    for _ in range(joining.REJOIN_FRAMES + 5):
+      self.steps.clear()
+      out = self._frame(s)
+      if self.big.calls > calls:
+        return out
+    self.fail('the window never opened')
+
+  def _taken_over(self, speeds=(0.0,)):
+    self.big.speeds = list(speeds)
+    s = self._state()
+    self._at_a_stop(s)
+    out = self._hold(s)
+    while out['from'] != 'big':
+      self.assertTrue(s._holding, 'let go')
+      out = self._frame(s)
+    self.assertTrue(s.chestnut)
+    return s
+
+  def _hand_back_lag(self, s, n_held=model_state.HOLDS_IN_A_ROW):
+    self.big.held_at = set(range(self.big.calls, self.big.calls + n_held))
+    self._drive(s, n_held - 1)
+    self.big.behind = f'held {n_held} frames in a row'
+    self._frame(s)
+    self.big.behind = None
+
+  def test_the_hold_runs_no_warm_frame_and_takes_over_on_the_answer_that_continues(self):
+    self.big.speeds = [3.5, 3.5, 0.0]
+    s = self._state()
+    self._at_a_stop(s)
+    out = self._hold(s)
+    n = self.frame_no
+    self.assertEqual(out['from'], 'small')
+    self.assertTrue(s._holding)
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', f'small run {n}', f'big end {n}'])
+    self.assertFalse(s._warming)
+    self.assertIsNone(s._cold)
+    self.steps.clear()
+    self.assertEqual(self._frame(s)['from'], 'small')
+    self.steps.clear()
+    out = self._frame(s)
+    n = self.frame_no
+    self.assertEqual(out['from'], 'big', 'its third answer continues')
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', f'small run {n}', f'big end {n}'])
+    # never reset, every frame once in order, the take-over's included
+    self.assertEqual(self.small.resets, 0)
+    self.assertEqual(self.small.history, list(range(1, n + 1)))
+    self.assertFalse(s._warming)
+    # alone and answering in time: not warming, the large model's frame whole
+    self.steps.clear()
+    self._frame(s)
+    n = self.frame_no
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', f'big end {n}'])
+
+  def test_the_first_frame_alone_after_a_take_over_keeps_the_small_models_history(self):
+    # the rule of 2ba97a5 with the warm hand-back on: _demote_warm must not
+    # reset a small model that missed only this frame, warm-up or none
+    for how in ('end', 'send', 'drops'):
+      with self.subTest(how=how):
+        self.steps = []
+        self.small, self.big = HistoryModel(self.steps), PlanLinkModel(self.steps)
+        self.log, self.frame_no = RecordingLog(), 0
+        s = self._taken_over()
+        if how == 'drops':
+          s.frame_drop_ratio = joining.DROP_LIMIT * 2
+        else:
+          self.big.fails, self.big.fails_at = RuntimeError('link gone'), self.big.calls
+          self.big.fails_on_send = how == 'send'
+        small_calls = self.small.calls
+        self.vx = 0.3   # still a stop, and not the plan the hold left
+        out = self._frame(s)
+        n = self.frame_no
+        self.assertEqual(out['from'], 'small')
+        self.assertEqual(self.small.calls, small_calls + 1, 'its frame, once')
+        self.assertEqual(self.small.resets, 0, 'the hold left its history whole')
+        self.assertEqual(self.small.history, list(range(1, n + 1)))
+        np.testing.assert_array_equal(s._small_plan, joining.plan_of(out))
+        self.vx = 0.0
+        s.frame_drop_ratio = 0.0
+        self._drive(s, joining.WARM_LOGGED - 1)
+        self.assertTrue(self.log.has('the small model was not reset, its history whole from the mid-drive hold'),
+                        self.log.lines('warning'))
+        self._close(s)
+
+  def test_a_held_take_over_warms_on_without_a_reset(self):
+    # nothing in control in the hold lands it at once, on a held frame: the
+    # warm-up starts from the next, on the small model the hold left whole
+    self.big.speeds = [3.5] * 20
+    s = self._state()
+    self._at_a_stop(s)
+    self._hold(s)
+    self.big.held_at = {self.big.calls}
+    s.in_control = False
+    self.assertEqual(self._frame(s)['from'], 'big')
+    self.assertTrue(s._warming)
+    self.assertTrue(self.log.has('the small model is whole from the mid-drive hold, not reset, and runs from the next'))
+    self.steps.clear()
+    self._frame(s)
+    n = self.frame_no
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', f'small run {n}', f'big end {n}'], 'no reset')
+    self._hand_back_lag(s)
+    out = self._frame(s)
+    n = self.frame_no
+    self.assertEqual(out['from'], 'small')
+    self.assertEqual(self.small.resets, 0)
+    self.assertEqual(self.small.history, list(range(1, n + 1)), 'every frame once: the hold, then warm')
+
+  def test_a_warm_run_that_fails_on_the_first_frame_alone_is_no_whole_history(self):
+    # a held take-over warms on without a reset; if that warm run fails and
+    # the large model's frame fails after it, the small model is reset before
+    # it runs the frame published: it may have half-run it already
+    self.big.speeds = [3.5] * 20
+    s = self._state()
+    self._at_a_stop(s)
+    self._hold(s)
+    self.big.held_at = {self.big.calls}
+    s.in_control = False
+    self.assertEqual(self._frame(s)['from'], 'big')
+    self.assertTrue(s._warming)
+    real = self.small.run
+
+    def fails_once(*args, **kwargs):
+      self.small.run = real
+      raise RuntimeError('small model fault')
+
+    self.small.run = fails_once
+    self.big.fails, self.big.fails_at = RuntimeError('no answer for frame in 0.2s'), self.big.calls
+    self.steps.clear()
+    out = self._frame(s)
+    n = self.frame_no
+    self.assertEqual((out['from'], out['frame']), ('small', n))
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', f'big end {n}', 'small reset', f'small run {n}'])
+    self.assertEqual(self.small.history, [n])
+
+  def test_a_warm_up_later_in_the_drive_resets_as_after_any_swap(self):
+    s = self._taken_over()
+    self._drive(s, 3)   # the small model misses these
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self.steps.clear()
+    self._frame(s)
+    n = self.frame_no
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', 'small reset', f'small run {n}', f'big end {n}'])
+    self.assertEqual(self.small.history, [n])
+    self._hand_back_lag(s)
+    resets = self.small.resets
+    self.assertEqual(self._frame(s)['from'], 'small')
+    self.assertEqual(self.small.resets, resets, 'warm: not reset at the hand-back')
+    self.assertEqual(self.small.history, list(range(n, self.frame_no + 1)))
+
+  def test_a_hold_let_go_is_no_hand_back(self):
+    self.big.speeds = [3.5] * 20
+    s = self._state()
+    self._at_a_stop(s)
+    self._hold(s)
+    while s._holding:
+      self.assertEqual(self._frame(s)['from'], 'small')
+    self.assertEqual(self.big.calls, joining.REJOIN_HOLD_FRAMES)
+    self.assertFalse(s.chestnut)
+    self.assertEqual(self.small.resets, 0)
+    self.assertIsNone(s._cold)
+    self.assertFalse(s._warming)
+    self._drive(s, joining.WARM_LOGGED + 1)
+    self.assertFalse(self.log.has('hand-back record'))
+    self.assertEqual(self.small.history, list(range(1, self.frame_no + 1)))
+
+  def test_unpublished_warm_runs_are_never_the_small_models_plan(self):
+    # from its reset the warm small model plans a cold start, 16 m/s at a
+    # stop: read, that would give the stop it had its try at a second one
+    s = self._taken_over()
+    self.assertTrue(s._stop_tried)
+    plan = s._small_plan.copy()
+    self._drive(s, 2)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self._drive(s, 3)
+    self.assertTrue(s._warming)
+    self.assertEqual(self.small.history, list(range(self.frame_no - 2, self.frame_no + 1)))
+    self.assertTrue(s._stop_tried, 'a warm run was read as a set-off')
+    np.testing.assert_array_equal(s._small_plan, plan)
+
+  def test_a_lost_hand_back_publishes_the_warm_run_and_reads_its_plan(self):
+    s = self._taken_over()
+    self._drive(s, 2)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self.vx = 0.3   # still a stop, and not the plan the hold left
+    self._drive(s, HistoryModel.COLD + 1)    # past its cold start: it plans the stop
+    self.assertEqual(float(s._small_plan[0, joining.PLAN_VX]), 0.0)
+    self.big.fails, self.big.fails_at = RuntimeError('no answer for frame in 0.2s'), self.big.calls
+    small_calls = self.small.calls
+    out = self._frame(s)
+    self.assertEqual((out['from'], out['frame']), ('small', self.frame_no))
+    self.assertEqual(self.small.calls, small_calls + 1, 'the frame is not run twice')
+    np.testing.assert_array_equal(s._small_plan, joining.plan_of(out))
+    self.assertAlmostEqual(float(s._small_plan[0, joining.PLAN_VX]), 0.3, places=5)
+    self.assertTrue(joining.stationary(s._small_plan))
+    self.assertTrue(s._stop_tried, 'the stop still had its try')
+
+  def test_an_ordinary_swap_warms_and_hands_back_as_without_a_window(self):
+    s = self._state()
+    s.in_control = False
+    self.vx = 5.0
+    self.assertEqual(self._frame(s)['from'], 'big')
+    self._drive(s, 9)
+    first_held = self.frame_no + 1
+    self._hand_back_lag(s)
+    resets = self.small.resets
+    out = self._frame(s)
+    self.assertEqual(out['from'], 'small')
+    self.assertEqual(self.small.resets, resets)
+    self.assertEqual(self.small.history, list(range(first_held + 1, self.frame_no + 1)))
+    # and the frame it published is the one the window reads
+    np.testing.assert_array_equal(s._small_plan, joining.plan_of(out))
+
+  def test_a_mid_drive_swap_starts_the_warm_up_afresh_as_any_swap(self):
+    # a warm-up turned off on one swap (its warm run failed) is on again for
+    # the next, a mid-drive one included: its state is reset at the build
+    s = self._state()
+    s.in_control = False
+    self.vx = 5.0
+    self.assertEqual(self._frame(s)['from'], 'big')
+    self._drive(s, 3)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self.small.raises = RuntimeError('small model fault')
+    self._frame(s)
+    self.small.raises = None
+    self.assertEqual(s._warm_off, 'its warm run failed')
+    self.big.fails, self.big.fails_at = RuntimeError('link gone'), self.big.calls
+    self.assertEqual(self._frame(s)['from'], 'small')
+    self.vx = 0.0
+    self._drive(s, joining.WARM_LOGGED)
+    self._at_a_stop(s)
+    self.big.speeds = [3.5] * self.big.calls + [0.0]
+    self._hold(s)
+    self.assertTrue(s.chestnut, 'took over on its first answer')
+    self.assertIsNone(s._warm_off)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self.assertTrue(s._warming)
+
+  def test_both_switches_are_keyword_only_and_off_by_default(self):
+    import inspect
+    params = inspect.signature(JoiningModelState).parameters
+    for name, default in (('warm_handback', False), ('rejoin', None)):
+      with self.subTest(name):
+        self.assertIs(params[name].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(params[name].default, default)
+    s = self._make(self.small, self._connect, self._build, reset_small=self.small.reset)
+    self.addCleanup(self._close, s)
+    self.assertFalse(s._warm_handback)
+    self.assertIsNone(s._ask_rejoin)
+    with self.assertRaises(TypeError):
+      JoiningModelState(self.small, self._connect, self._build, None, self.small.reset, self.progress, self.log)
 
 
 if __name__ == '__main__':

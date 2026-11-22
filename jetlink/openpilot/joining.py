@@ -50,13 +50,17 @@ reaches an actuator: the adapter says so for REJOIN_FRAMES frames running (a
 held stop, openpilot itself disengaged, its lateral and longitudinal control
 both inactive, no override, no alert), the link has been ready REJOIN_READY_S
 with its keepalive answering, and the small model's own plan is stationary.
-The large model's first frame must then continue the small model's last
-(REJOIN_PLAN_DV, REJOIN_PLAN_DY) or it is not published: the small model runs
-that frame and keeps driving, its history untouched, and the window stays shut
-until the small model's plan has set off again (one try per stop: each try
-costs modeld the large model's slow first frame). Openpilot holding the car at
-a stop is still in control and never a window: its longitudinal plan decides
-when the car moves.
+Such a swap starts unpublished (the hold): the large model runs each frame
+while the small model drives it, and takes over from the first of its answers
+whose plan continues the small model's plan of the same frame (REJOIN_PLAN_DV,
+REJOIN_PLAN_DY). Its first answers come from a reset history and plan a car
+setting off at a dead stop, so the first frame alone is no test. One that has
+not continued in REJOIN_HOLD_FRAMES answers, or before the window shuts, is
+let go unpublished; the small model, which ran every frame, drives on with its
+history whole, and the window stays shut until the small model's plan has set
+off again (one try per stop: each try costs modeld the large model's slow
+first frame). Openpilot holding the car at a stop is still in control and
+never a window: its longitudinal plan decides when the car moves.
 """
 from __future__ import annotations
 
@@ -128,8 +132,8 @@ BAD_OUTPUT = 'jetlink output not finite'
 SMALL_READS = ('desire_key', 'numpy_inputs')
 # why a built model was let go before it drove
 NOT_UP = 'could not bring up the large model'
-# and why one that swapped in mid-drive was let go on its first frame, unpublished
-# (the mid-drive window, below)
+# and why one that swapped in mid-drive was let go unpublished, its plan not
+# continuing the small model's in time (the mid-drive window, below)
 DISCONTINUOUS = 'jetlink plan did not continue'
 # and as the leave says it to the server (protocol.Msg.LEAVE)
 LEAVING = {LOST: P.LEAVE_LOST, BEHIND: P.LEAVE_BEHIND}
@@ -217,20 +221,32 @@ REJOIN_PING_FRESH = 2.5
 # the plans are compared over their first REJOIN_HORIZON_S, as modeld parses
 # them: outputs['plan'], (1, IDX_N, PLAN_WIDTH) over T_IDXS = 10 (i / 32)^2 s,
 # lateral position at PLAN_Y and forward speed at PLAN_VX (openpilot's
-# modeld.constants.Plan: POSITION 0:3, VELOCITY 3:6)
+# modeld.constants.Plan: POSITION 0:3, VELOCITY 3:6; the columns the warm
+# hand-back's record reads, defined once above)
 REJOIN_HORIZON_S = 2.0
 PLAN_IDX_N = 33
-PLAN_Y = 1
-PLAN_VX = 3
 REJOIN_HORIZON = sum(1 for i in range(PLAN_IDX_N) if 10.0 * (i / (PLAN_IDX_N - 1)) ** 2 <= REJOIN_HORIZON_S)
 # the small model's plan is stationary: never faster than this over the horizon,
 # in m/s. A plan that sets off is a car about to move, not a stop to swap in
 REJOIN_PLAN_SPEED = 0.5
-# the large model's first plan continues the small model's last: speeds within
-# REJOIN_PLAN_DV m/s and lateral positions within REJOIN_PLAN_DY m, point by
-# point over the horizon. At a held stop both plans are a car that stays put
+# the large model's plan continues the small model's of the same frame: speeds
+# within REJOIN_PLAN_DV m/s and lateral positions within REJOIN_PLAN_DY m, point
+# by point over the horizon. At a held stop both plans are a car that stays put
 REJOIN_PLAN_DV = 0.5
 REJOIN_PLAN_DY = 0.5
+# answers the large model may give unpublished before it must have continued
+# the small model's plan (the hold). Its history moves on every frame_skip (4)
+# frames, so its first four answers all come from the reset: at the three
+# standstill joins of 2026-11-21 they planned 2.9 to 4.2 m/s at a dead stop.
+# The fifth is the first with real history. At two of the joins it came within
+# 0.29 m/s and 0.10 m of the small model's plan at every frame of every
+# fallback stop it was paired with, and stayed there; the third was still
+# settling (0.62 m/s off on its fifth, 0.49 on its eighth, 1.28 by its 37th,
+# under 0.5 again from its 57th). Answers 6 to 8 share the fifth's history:
+# they rescued none of the first two and only let the third through on a
+# frame before it drifted off, so more is no margin. Counted in answers, not
+# frames: a frame the large model holds says nothing new of its plan
+REJOIN_HOLD_FRAMES = 5
 
 
 def plan_of(outputs) -> np.ndarray | None:
@@ -256,15 +272,25 @@ def stationary(plan) -> bool:
   return plan is not None and float(np.abs(plan[:, PLAN_VX]).max()) <= REJOIN_PLAN_SPEED
 
 
+def plan_gap(before, after) -> tuple[float, float] | None:
+  """How far the plan `after` (plan_of) is from `before`: the largest speed
+  and lateral position differences point by point over the horizon, in m/s
+  and m, or None without both plans."""
+  if before is None or after is None:
+    return None
+  return (float(np.abs(after[:, PLAN_VX] - before[:, PLAN_VX]).max()),
+          float(np.abs(after[:, PLAN_Y] - before[:, PLAN_Y]).max()))
+
+
 def discontinuity(before, after) -> str | None:
-  """Why the plan `after` (plan_of) does not continue `before`, the frame just
-  ahead of it, or None when it does: speeds within REJOIN_PLAN_DV and lateral
-  positions within REJOIN_PLAN_DY, point by point over the horizon."""
-  a, b = before, after
-  if a is None or b is None:
+  """Why the plan `after` (plan_of) does not continue `before`, or None when
+  it does: speeds within REJOIN_PLAN_DV and lateral positions within
+  REJOIN_PLAN_DY, point by point over the horizon. In the hold `before` is
+  the small model's plan of the same frame."""
+  gap = plan_gap(before, after)
+  if gap is None:
     return 'no plan to compare'
-  dv = float(np.abs(b[:, PLAN_VX] - a[:, PLAN_VX]).max())
-  dy = float(np.abs(b[:, PLAN_Y] - a[:, PLAN_Y]).max())
+  dv, dy = gap
   if dv > REJOIN_PLAN_DV or dy > REJOIN_PLAN_DY:
     return f"speed {dv:.2f} m/s and lateral position {dy:.2f} m off"
   return None
@@ -277,9 +303,13 @@ class JoiningModelState:
   `log` is cloudlog on a comma, and `in_control` the adapter's, asked before
   every frame; without one, the in_control last written stands. `name` is
   the catalog's name for a model's sha256, for the runtime record.
-  `rejoin` is the adapter's mid-drive window (Openpilot.mid_drive_window),
-  asked before every frame on which a ready link waits with something in
-  control; without one, as by default, the swap waits for nothing in control.
+  `warm_handback` keeps the small model warm for a hand-back (WARM_QUIET),
+  off by default. `rejoin` is the adapter's mid-drive window
+  (Openpilot.mid_drive_window), asked before every frame on which a ready
+  link waits, or a swap through it is held, with something in control;
+  without one, as by default, the swap waits for nothing in control. The two
+  are independent: the warm-up runs only while the large model drives, the
+  window only while the small model does.
   """
 
   def __init__(self, small, connect, build, prepare=None, reset_small=None, *, progress, log, in_control=None,
@@ -310,8 +340,9 @@ class JoiningModelState:
     # a link is ready and waiting for the window. Kept true while a keepalive
     # ping has _joined out for a moment
     self._available = False
-    # the large model state, from the swap until it hands back: always _active.
-    # Only the frame thread assigns it
+    # the large model state, from the swap until it hands back: _active, but
+    # for the frames of a mid-drive swap's hold (_holding), when the small
+    # model still drives. Only the frame thread assigns it
     self._big = None
     # what the frame thread let go of and why (LOST, BEHIND, BAD_OUTPUT, or a
     # build that failed), for the join thread to say goodbye to and close or keep.
@@ -357,17 +388,24 @@ class JoiningModelState:
     # running it has said yes on, when the waiting link became ready, its
     # keepalive answers since and the newest one's time (the join thread's),
     # the small model's last plan (plan_of), which a swap in it must
-    # continue, whether the swap being made is one, whether this stop has
-    # had its try, and the window's last error, said once
+    # continue, whether this stop has had its try, and the window's last
+    # error, said once
     self._ask_rejoin = rejoin
     self._rejoin_run = 0
     self._ready_at = 0.0
     self._pings = 0
     self._pinged_at = 0.0
     self._small_plan = None
-    self._mid_drive = False
     self._stop_tried = False
     self._rejoin_error: str | None = None
+    # and a swap through it: whether the large model is held, unpublished
+    # (_big built, the small model driving), its frames and its answers so
+    # far, and whether it has taken over and not yet run a frame alone, the
+    # first one the small model will not have run
+    self._holding = False
+    self._held_frames = 0
+    self._answers = 0
+    self._mid_drive = False
 
     # whether the large model has produced a frame; a first inference that
     # fails never announces readiness. Travels in modelV2.big and
@@ -443,7 +481,10 @@ class JoiningModelState:
     demote. modeld resets its dropped-frame filter when this changes across
     run(), so the stall of a handover is not lag, as for a chestnut's fallback.
     A count and not modelV2.big: a swap whose first frame fails and demotes in
-    the same run() leaves `chestnut` as it was."""
+    the same run() leaves `chestnut` as it was. A mid-drive swap moves it on
+    the first frame of its hold, which carries the large model's reset (its
+    slow first answer), again when the large model takes over on a later
+    frame, and when it is let go unpublished."""
     return self._handovers
 
   @property
@@ -453,6 +494,9 @@ class JoiningModelState:
       return 'unavailable'
     if self._active is not self._small:
       return 'running'
+    if self._holding:
+      # built and answering, not yet published: the swap is still landing
+      return 'joining'
     if self.big_model_available:
       # nothing left to wait for but a window. The icon says so rather than
       # pulsing "loading" for the rest of a drive with no stop in it
@@ -471,10 +515,10 @@ class JoiningModelState:
   @lat_delay.setter
   def lat_delay(self, value):
     # modeld writes this every frame. Set on both, so a model that joins
-    # mid-drive does not start on a stale delay
+    # mid-drive, or is held before it takes over, does not start on a stale delay
     self._small.lat_delay = value
-    if self._active is not self._small:
-      self._active.lat_delay = value
+    if self._big is not None:
+      self._big.lat_delay = value
 
   @property
   def PLANPLUS_CONTROL(self):
@@ -483,8 +527,8 @@ class JoiningModelState:
   @PLANPLUS_CONTROL.setter
   def PLANPLUS_CONTROL(self, value):
     self._small.PLANPLUS_CONTROL = value
-    if self._active is not self._small:
-      self._active.PLANPLUS_CONTROL = value
+    if self._big is not None:
+      self._big.PLANPLUS_CONTROL = value
 
   @property
   def frame_drop_ratio(self) -> float:
@@ -537,6 +581,10 @@ class JoiningModelState:
     self._maybe_swap()
     if self._active is self._small:
       self._small_frames += 1
+      # the hold first: its frames are the small model's, published, with
+      # the large model's on the link (a swap clears the hand-back record)
+      if self._holding:
+        return self._run_held(bufs, transforms, inputs, after_enqueue)
       if self._cold is not None:
         return self._run_small_recorded(bufs, transforms, inputs, after_enqueue)
       return self._run_small(bufs, transforms, inputs, after_enqueue)
@@ -547,19 +595,27 @@ class JoiningModelState:
     read before the small model runs again: a swap on the next frame must
     continue it, and a plan that sets off ends the stop that had its try."""
     result = self._small.run(bufs, transforms, inputs, after_enqueue)
+    self._small_published(result)
+    return result
+
+  def _small_published(self, result) -> None:
+    """A frame of the small model's goes out as modelV2, run now or warm in
+    the large model's wait (_fall_back): with a mid-drive window its plan is
+    the small model's last, as for every frame it publishes. The warm runs
+    it does not publish are never read here: the plan a swap must continue,
+    and a set-off, are the ones modelV2 carried."""
     if self._ask_rejoin is not None:
       self._small_plan = plan_of(result)
       if self._stop_tried and not stationary(self._small_plan):
         self._stop_tried = False
-    return result
 
   def _count_rejoin(self) -> None:
     """The frames running the mid-drive window has said yes on. Asked only
-    while it could matter: a link ready and waiting, the small model driving,
-    something in control. Anything else, a no or a window that raises,
-    starts the count again."""
+    while it could matter: a link ready and waiting or a swap held through
+    the window, the small model driving, something in control. Anything else,
+    a no or a window that raises, starts the count again."""
     ask = self._ask_rejoin
-    if ask is None or not (self._in_control and self._available and self._active is self._small):
+    if ask is None or not (self._in_control and (self._available or self._holding) and self._active is self._small):
       self._rejoin_run = 0
       return
     try:
@@ -596,12 +652,6 @@ class JoiningModelState:
       result = big.run(bufs, transforms, inputs, after_enqueue)
     except Exception as e:
       return self._fall_back(e, bufs, transforms, inputs, started)
-    if self._mid_drive:
-      # the first frame of a swap with something in control: published only
-      # if it continues the small model's last
-      self._mid_drive = False
-      if (why := discontinuity(self._small_plan, plan_of(result))) is not None:
-        return self._unswap(why, bufs, transforms, inputs)
     if self._warm_handback:
       self._noted(big, result)
     return self._ran_big(big, result)
@@ -611,7 +661,11 @@ class JoiningModelState:
     drives it. Called inside the except clause, whose exception is logged.
     `ran` is the small model's own output for this frame, from a warm run in
     the large model's wait, published rather than run again: a second run of
-    one camera frame would put it in the small model's history twice."""
+    one camera frame would put it in the small model's history twice. The
+    small model is reset as _demote says: not after warm frames, and not on
+    the first frame the large model runs alone after a mid-drive take-over,
+    the one frame the small model had not run. Either way the frame's plan is
+    the small model's last (_small_published)."""
     failed = time.monotonic()
     self._log.exception("jetlink: large model failed mid-drive, back to the small model")
     self._demote(BAD_OUTPUT if isinstance(e, P.NotFinite) else LOST)
@@ -620,6 +674,7 @@ class JoiningModelState:
       self._log.warning("jetlink: fallback frame %.0f ms: link with the small model's warm run in its wait %.0f, "
                         "demote %.0f; its warm output is this frame's", (demoted - started) * 1e3,
                         (failed - started) * 1e3, (demoted - failed) * 1e3)
+      self._small_published(ran)
       self._recorded(ran)
       return ran
     # re-run the frame rather than propagate: modeld's fallback is permanent,
@@ -672,11 +727,14 @@ class JoiningModelState:
     """The small model's unpublished run of this frame, from a reset on the
     warm-up's first. Never raises: a failure is said once and ends the
     warm-up for this swap, and the hand-back resets the small model as
-    without one. None when it did not run."""
+    without one. None when it did not run. A warm-up that starts on the first
+    frame the large model runs alone after a mid-drive take-over is not
+    reset: the small model ran every frame of the hold, the take-over's
+    included, so its history is whole and this frame continues it."""
     reset = self._reset_small
     self._reset_s = 0.0
     try:
-      if self._warm == 0:
+      if self._warm == 0 and not self._mid_drive:
         t0 = time.monotonic()
         if reset is not None:
           reset()
@@ -684,6 +742,9 @@ class JoiningModelState:
       out = self._small.run(bufs, transforms, inputs, None)
     except Exception:
       self._log.exception("jetlink: the small model's warm run failed")
+      # whatever it left of this frame, its history is not the hold's whole
+      # one any more: a hand-back on this frame resets it (_demote)
+      self._mid_drive = False
       self._warm_stop('its warm run failed')
       return None
     self._warm += 1
@@ -716,9 +777,11 @@ class JoiningModelState:
     self._warming, self._warm = False, 0
     self._log.warning("jetlink: the small model's warm-up is off until the next swap: %s", why)
 
-  def _noted(self, big, result) -> None:
+  def _noted(self, big, result, whole: bool = False) -> None:
     """After a frame the large model drove: a held frame starts the warm-up,
-    from the next frame; WARM_QUIET frames answered in time end it."""
+    from the next frame; WARM_QUIET frames answered in time end it. `whole`
+    on a mid-drive take-over's frame, whose warm-up starts on a small model
+    the hold left whole, without a reset (_warm_run)."""
     self._big_point = plan_point(result)
     now, times = time.monotonic(), self._warm_times
     while times and now - times[0] > HOLD_WINDOW:
@@ -735,8 +798,9 @@ class JoiningModelState:
         self._warming, self._warm = True, 0
         self._warm_ms = [0.0, 0.0, 0.0, 0.0]
         self._first_points, self._last_points = [], deque(maxlen=WARM_LOGGED)
-        self._log.warning("jetlink: the large model held a frame; the small model is reset and runs from the next "
-                          "one unpublished, warm for a hand-back")
+        self._log.warning("jetlink: the large model held a frame; the small model is %s and runs from the next "
+                          "one unpublished, warm for a hand-back",
+                          'whole from the mid-drive hold, not reset,' if whole else 'reset')
     elif self._warming:
       self._quiet += 1
       if self._quiet >= WARM_QUIET:
@@ -745,21 +809,23 @@ class JoiningModelState:
                           "%.1f ms, reset %.1f ms)", self._quiet, self._warm, *self._warm_ms)
         self._warming, self._warm, self._quiet = False, 0, 0
 
-  def _demote_warm(self, why: str) -> None:
+  def _demote_warm(self, why: str, kept: bool = False) -> None:
     """_demote's reset with the warm-up on: none when the small model has
     run the large model's last frames from its own reset, a reset as without
-    the warm-up when it has not. The hand-back's record starts here."""
+    the warm-up when it has not. None either when `kept`: the large model's
+    first frame alone after a mid-drive take-over, the small model having
+    run every frame before it (_demote). The hand-back's record starts here."""
     warm = self._warm if self._warming else 0
-    if warm == 0 and self._reset_small is not None:
+    if warm == 0 and not kept and self._reset_small is not None:
       self._reset_small()
-    self._cold = {'why': why, 'warm': warm, 'off': self._warm_off, 'big': self._big_point,
+    self._cold = {'why': why, 'warm': warm, 'off': self._warm_off, 'big': self._big_point, 'kept': kept and not warm,
                   'first': list(self._first_points) if warm else [], 'last': list(self._last_points) if warm else [],
                   'ms': list(self._warm_ms), 'after': []}
     self._warming, self._warm, self._quiet = False, 0, 0
 
   def _run_small_recorded(self, bufs, transforms, inputs, after_enqueue):
     """The small model's frame after a hand-back, its plan kept for the record."""
-    result = self._small.run(bufs, transforms, inputs, after_enqueue)
+    result = self._run_small(bufs, transforms, inputs, after_enqueue)
     self._recorded(result)
     return result
 
@@ -781,6 +847,8 @@ class JoiningModelState:
       how = (f"warm, not reset: {cold['warm']} frames run unpublished (small model up to {ms[0]:.1f} ms, done up to "
              f"{ms[1]:.1f} ms into the frame, frame up to {ms[2]:.1f} ms, its reset {ms[3]:.1f} ms); its first warm "
              f"frames planned {said_points(cold['first'])}, its last {said_points(cold['last'])}")
+    elif cold['kept']:
+      how = 'not reset, its history whole from the mid-drive hold'
     else:
       how = 'cold, reset at the hand-back' + (f" (warm-up off: {cold['off']})" if cold['off'] else '')
     self._log.warning("jetlink: hand-back record (%s): the small model was %s. Its first %d published frames "
@@ -789,6 +857,20 @@ class JoiningModelState:
 
   def _ran_big(self, big, result):
     """After a frame the large model drove and answered or held."""
+    # after a mid-drive take-over the small model has missed a frame now,
+    # unless it ran it warm, which _demote_warm counts
+    self._mid_drive = False
+    self._published(big)
+    if big.behind:
+      # this frame's output is published as it came; its stall is forgiven now
+      self._lagging = True
+      self._handed_over()
+      self._log.warning("jetlink: large model %s, the small model drives from the next", big.behind)
+    return result
+
+  def _published(self, big) -> None:
+    """A frame of the large model's goes out as modelV2: the runtime record's
+    last answer, and on the first, the join announced."""
     if not getattr(big, 'held', False):
       self._output_at = time.monotonic()
     if self._loading:
@@ -799,12 +881,123 @@ class JoiningModelState:
       self._rejoin.set()
       self._record.set()
       self._log.warning("jetlink: large model joined mid-drive, modelV2.big is now true")
-    if big.behind:
-      # this frame's output is published as it came; its stall is forgiven now
-      self._lagging = True
-      self._handed_over()
-      self._log.warning("jetlink: large model %s, the small model drives from the next", big.behind)
+
+  def _run_held(self, bufs, transforms, inputs, after_enqueue):
+    """A frame of a mid-drive swap's hold: the large model runs it unpublished
+    while the small model drives it, and takes over from the first of its
+    answers whose plan continues the small model's plan of this frame.
+
+    The large model's frame goes out first and is collected after the small
+    model's, so the host works through the small model's run: the split a
+    JetlinkModelState's run() makes (prepare, send, end); a model without it
+    runs whole, first. Its frames are its own, as after any swap: the reset on
+    the first, its held frames and their rules (model_state.HOLD_FRAME,
+    behind). A frame it holds has no answer of its own and is not compared.
+    It is let go unpublished when it fails, falls behind, the window shuts,
+    or REJOIN_HOLD_FRAMES answers have not continued; the small model ran
+    every frame, so its history is whole and kept."""
+    big = self._big
+    self._held_frames += 1
+    first = self._held_frames == 1
+    split = all(callable(getattr(big, name, None)) for name in ('prepare', 'send', 'end'))
+    t0 = time.monotonic()
+    out = None
+    try:
+      if split:
+        big.prepare(bufs, transforms, inputs)
+        big.send()
+      else:
+        out = big.run(bufs, transforms, inputs, None)
+    except Exception as e:
+      self._let_go_failed(e, first)
+      return self._run_small(bufs, transforms, inputs, after_enqueue)
+    t1 = time.monotonic()
+    result = self._run_small(bufs, transforms, inputs, after_enqueue)
+    t2 = time.monotonic()
+    if split:
+      try:
+        out = big.end()
+      except Exception as e:
+        self._let_go_failed(e, first)
+        return result
+    t3 = time.monotonic()
+    timing = f"large model out {(t1 - t0) * 1e3:.1f}, small model {(t2 - t1) * 1e3:.1f}, large model in {(t3 - t2) * 1e3:.1f} ms"
+    if (behind := getattr(big, 'behind', None)) is not None:
+      # a frame held past its settling ones: behind before it ever drove
+      self._log.warning("jetlink: large model %s while it was held mid-drive (%s); the small model drives on", behind, timing)
+      self._let_go(BEHIND, first)
+      return result
+    if not self._in_control:
+      # nothing in control any more: the ordinary window, which has no rule
+      self._log.warning("jetlink: held frame %d: nothing is in control now (%s)", self._held_frames, timing)
+      return self._take_over(out, first)
+    if self._rejoin_run < REJOIN_FRAMES or not stationary(self._small_plan):
+      self._log.warning("jetlink: the window shut on held frame %d, %d answers in, before the large model's plan "
+                        "continued the small model's (%s); the small model drives on", self._held_frames, self._answers,
+                        timing)
+      self._let_go(DISCONTINUOUS, first)
+      return result
+    if getattr(big, 'held', False):
+      self._log.warning("jetlink: held frame %d: no answer of its own yet (%s)", self._held_frames, timing)
+      return result
+    self._answers += 1
+    plan = plan_of(out)
+    gap, why = plan_gap(self._small_plan, plan), discontinuity(self._small_plan, plan)
+    said = 'no plan to compare' if gap is None else f"speed {gap[0]:.2f} m/s and lateral position {gap[1]:.2f} m off"
+    self._log.warning("jetlink: held frame %d, answer %d of at most %d: %s, %s (%s)", self._held_frames, self._answers,
+                      REJOIN_HOLD_FRAMES, said, 'continues' if why is None else 'does not continue', timing)
+    if why is None:
+      return self._take_over(out, first)
+    if self._answers >= REJOIN_HOLD_FRAMES:
+      self._log.warning("jetlink: the large model's plan mid-drive does not continue the small model's in %d answers "
+                        "(%s); the small model drives on", self._answers, why)
+      self._let_go(DISCONTINUOUS, first)
     return result
+
+  def _take_over(self, out, first: bool):
+    """The hold is over and the swap lands: the large model drives from this
+    frame, whose output is its answer. The next frame it runs alone is the
+    first the small model will not have run (_demote). On the hold's first
+    frame this is the handover the hold's start counted."""
+    big = self._big
+    self._holding = False
+    self._active = big
+    self._mid_drive = True
+    self._rejoin_run = 0
+    if not first:
+      self._handed_over()
+    self._log.warning("jetlink: the large model takes over mid-drive on held frame %d", self._held_frames)
+    if self._warm_handback:
+      # its first frame driving, noted as any other: a held one starts the
+      # warm-up from the next, on a small model the hold left whole (_warm_run)
+      self._noted(big, out, whole=True)
+    self._published(big)
+    return out
+
+  def _let_go_failed(self, e: Exception, first: bool) -> None:
+    """The held large model raised: lost, or an answer that is not finite."""
+    self._log.exception("jetlink: large model failed while it was held mid-drive, unpublished; the small model drives on")
+    self._let_go(BAD_OUTPUT if isinstance(e, P.NotFinite) else LOST, first)
+
+  def _let_go(self, why: str, first: bool) -> None:
+    """The hold is over and the large model never published: it goes as one
+    that would not come up, its live link kept for the next window, and backed
+    off; a lost link counts as one, a lag as one, a plan that did not continue
+    as neither. The small model drove every frame of it: its history is whole
+    and is kept. This stop has had its try. On the hold's first frame this
+    and the hold's start are two handovers in one run(), as for a swap whose
+    first frame fails."""
+    big, self._big = self._big, None
+    self._holding = False
+    if why in LAGS:
+      self._lags += 1
+    elif why == LOST:
+      self._drops += 1
+    with self._lock:
+      self._retired = (big, why)
+    self._back_off()
+    self._handed_over()
+    self._loading = True
 
   def _maybe_swap(self) -> None:
     """Build the large model state from a join that has landed and swap it in,
@@ -840,51 +1033,39 @@ class JoiningModelState:
       return
     self._big = big
     self._joined_at = time.monotonic()
-    # no wake: the record says the swap with the first answer, which wakes it
+    # no wake: the record says the swap with the first answer, which wakes it.
+    # A mid-drive swap's count moves now too, on the frame of its reset
     self._handovers += 1
-    self._active = big
     if self._warm_handback:
       # a swap starts cold, with the warm-up on if the large model splits its
-      # frame as JetlinkModelState does (prepare, send, end)
+      # frame as JetlinkModelState does (prepare, send, end). A mid-drive
+      # swap's too, from its build: its hold runs no warm frame, and what the
+      # warm-up keeps is the large model's from its take-over
       split = all(callable(getattr(big, name, None)) for name in ('prepare', 'send', 'end'))
       self._warming, self._warm, self._quiet = False, 0, 0
       self._warm_off = None if split else "the large model's frame is not split (prepare, send, end)"
       self._cold, self._big_point = None, None
       self._first_points, self._last_points = [], deque(maxlen=WARM_LOGGED)
-    self._mid_drive = mid_drive
-    self._rejoin_run = 0
     if mid_drive:
-      self._log.warning("jetlink: swapping the large model in mid-drive: nothing in control acts on the model now")
-
-  def _unswap(self, why: str, bufs, transforms, inputs):
-    """A mid-drive swap whose first frame does not continue the small model's
-    last: that frame is not published. The small model runs it and drives
-    on, its history untouched, as it has missed no frame; the large model
-    state goes as one that would not come up, its live link kept for the
-    next window, and backed off. Two handovers in one run(), so modeld
-    forgives the frame's stall, and modelV2.big never says it drove.
-    after_enqueue is dropped, as at a failure: the large model may have
-    called it."""
-    self._log.warning("jetlink: the large model's first plan mid-drive does not continue the small model's (%s); "
-                      "the small model drives on", why)
-    big, self._big = self._big, None
-    with self._lock:
-      self._retired = (big, DISCONTINUOUS)
-    self._back_off()
-    self._active = self._small
-    self._handed_over()
-    self._loading = True
-    return self._run_small(bufs, transforms, inputs, None)
+      # unpublished until its plan continues the small model's (_run_held)
+      self._holding, self._held_frames, self._answers = True, 0, 0
+      self._log.warning("jetlink: swapping the large model in mid-drive, held unpublished until its plan continues "
+                        "the small model's (at most %d answers): nothing in control acts on the model now",
+                        REJOIN_HOLD_FRAMES)
+      return
+    self._active = big
+    self._rejoin_run = 0
 
   def _demote(self, why: str) -> None:
     """Back to the small model, from a reset history. On the frame thread, so
     nothing here waits: the join thread reads the port, reports and closes
     the link, moments later. Counted as a lost link or a hand-back for lag,
-    and backed off. With the warm hand-back on, a small model that warmed
-    through the large model's last frames is not reset (_demote_warm). The
-    first frame of a mid-drive swap is the one frame the small model did not
-    run: its history is whole and is kept, so the stop goes on with the plan
-    it had."""
+    and backed off. The first frame the large model runs alone after taking
+    over mid-drive is the one frame the small model did not run: its history
+    is whole and is kept, so the stop goes on with the plan it had. With the
+    warm hand-back on, a small model that warmed through the large model's
+    last frames is not reset either (_demote_warm), and the hand-back's
+    record says which it was."""
     big, self._big = self._big, None
     first_mid_drive, self._mid_drive = self._mid_drive, False
     if why in LAGS:
@@ -898,7 +1079,7 @@ class JoiningModelState:
     self._handed_over()
     self._loading = True
     if self._warm_handback:
-      self._demote_warm(why)
+      self._demote_warm(why, kept=first_mid_drive)
     elif self._reset_small is not None and not first_mid_drive:
       self._reset_small()
 
@@ -1199,7 +1380,8 @@ class JoiningModelState:
       if first:
         self._say_leaving(joined[0], P.LEAVE_STOPPED)
       joined[0].close()
-    big, self._big = self._big, None
+    # a held large model goes with it, unpublished
+    big, self._big, self._holding = self._big, None, False
     close = getattr(big, 'close', None)
     if close is not None:
       if first:

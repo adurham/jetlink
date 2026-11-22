@@ -174,12 +174,13 @@ class ModelSide(WorkerSide, Protocol):
     to say False, as without the member). For a fork whose lateral-only mode
     (MADS) stays in control for whole drives. Asked once on modeld's main
     thread; the callable then runs on modeld's frame thread, after
-    in_control(), before frames on which a ready link waits with something
-    in control. It never blocks or raises, and answers True (a bool, nothing
-    else counts) only when nothing the model outputs reaches an actuator: a
-    held stop, openpilot itself disengaged, lateral and longitudinal control
-    inactive, no driver override, services alive and valid. False when it
-    cannot tell. jetlink adds its own rules on top (joining.REJOIN_*)."""
+    in_control(), before frames on which a ready link waits, or a swap
+    through it is held unpublished, with something in control. It never
+    blocks or raises, and answers True (a bool, nothing else counts) only
+    when nothing the model outputs reaches an actuator: a held stop,
+    openpilot itself disengaged, lateral and longitudinal control inactive,
+    no driver override, services alive and valid. False when it cannot
+    tell. jetlink adds its own rules on top (joining.REJOIN_*)."""
 
   def model_warp(self, small: Any, cam_w: int, cam_h: int, model_w: int, model_h: int) -> FrameWarp | None:
     """Optional (OPTIONAL): the warp the link sends frames through, warmed,
@@ -258,7 +259,7 @@ class FrameWarp(Protocol):
 # the protocols, where a name would be a member itself; a type checker still
 # asks for these, as typing has no optional member
 OPTIONAL: dict[type, tuple[str, ...]] = {
-    ModelSide: ('small_reset', 'model_warp', 'warm_handback', 'mid_drive_window'),
+  ModelSide: ('small_reset', 'model_warp', 'warm_handback', 'mid_drive_window'),
   SmallModel: ('desire_key', 'numpy_inputs', 'lat_delay', 'PLANPLUS_CONTROL'),
   JoinedModel: ('get_action_from_model', 'constants', 'LAT_SMOOTH_SECONDS', 'LONG_SMOOTH_SECONDS', 'lat_delay'),
 }
