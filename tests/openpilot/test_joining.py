@@ -25,7 +25,8 @@ import numpy as np
 
 import jetlink.openpilot as jo
 from jetlink.comma import gadget
-from jetlink.openpilot import interface, joining, link, status, warp
+from jetlink.client import LinkError
+from jetlink.openpilot import interface, joining, link, model_state, status, warp
 from jetlink.openpilot.joining import REJOIN_DELAY_QUICK, STABLE_SECONDS, JoiningModelState
 from jetlink.openpilot.status import Status
 from tests.openpilot import fakes
@@ -1487,6 +1488,514 @@ class AnyForkTest(OpenpilotTest):
     with self.assertRaisesRegex(RuntimeError, r"model_warp is not a warp: output: missing, start\(frame\)"):
       joining.join(self.parts, 1928, 1208, fakes.starpilot()[0])
     self.parts.warps.load.assert_not_called()
+
+
+class HistoryModel(FakeModel):
+  """A small model whose history is the camera frames it has run since its
+  last reset, as a real one's queues are: run() appends the frame's id
+  (inputs['frame']) and a reset clears it. Its plan's speed is the cold
+  start's 16 m/s on the first COLD frames from a reset and the frame's own
+  `vx` after, as on the drive of 2026-11-21 (frame 5 sane). Its calls go in
+  `steps`, a list shared with the large model."""
+
+  COLD = 4
+
+  def __init__(self, steps):
+    super().__init__('small')
+    self.history: list = []
+    self.resets = 0
+    self.steps = steps
+
+  def reset(self):
+    self.resets += 1
+    self.history.clear()
+    self.steps.append('small reset')
+
+  def run(self, bufs, transforms, inputs, after_enqueue=None):
+    out = super().run(bufs, transforms, inputs, after_enqueue)
+    self.history.append(inputs.get('frame'))
+    self.steps.append(f"small run {inputs.get('frame')}")
+    vx = 16.0 if len(self.history) <= self.COLD else inputs.get('vx', 5.0)
+    out['plan'] = plan_array(vx)
+    out['frame'] = inputs.get('frame')
+    return out
+
+
+def plan_array(vx, y=0.0):
+  p = np.zeros((1, 33, 15), np.float32)
+  p[0, :, 3] = vx
+  p[0, :, 1] = y
+  return p
+
+
+class LinkModel(FakeModel):
+  """A large model whose frame is split as JetlinkModelState's is (prepare,
+  send, end; run() is all three), whose frame `k` (0-based) is held when k
+  is in `held_at`, and which raises `fails` on the end() of frame `fails_at`
+  (or on its send() when `fails_on_send`). Its calls go in `steps`."""
+
+  def __init__(self, steps, held_at=(), split=True):
+    super().__init__('big', chestnut=True, client=mock.Mock(dead=False))
+    self.steps = steps
+    self.held_at = set(held_at)
+    self.held = False
+    self.fails = self.fails_at = None
+    self.fails_on_send = False
+    self.frame = None
+    self.split = split
+
+  def prepare(self, bufs, transforms, inputs):
+    self.frame = inputs.get('frame')
+    self.steps.append(f'big prepare {self.frame}')
+
+  def send(self, want_telemetry=False):
+    self.steps.append(f'big send {self.frame}')
+    if self.fails_on_send and self.fails is not None and self.calls == self.fails_at:
+      self.calls += 1
+      raise self.fails
+
+  def end(self, after_enqueue=None):
+    self.steps.append(f'big end {self.frame}')
+    k = self.calls
+    self.calls += 1
+    if self.fails is not None and k == self.fails_at and not self.fails_on_send:
+      raise self.fails
+    if after_enqueue is not None:
+      after_enqueue()
+    self.held = k in self.held_at
+    return {'from': 'big', 'plan': plan_array(7.0), 'frame': self.frame}
+
+  def run(self, bufs, transforms, inputs, after_enqueue=None):
+    self.prepare(bufs, transforms, inputs)
+    self.send(after_enqueue is not None)
+    return self.end(after_enqueue)
+
+
+class WholeModel(LinkModel):
+  """...whose frame is not split: run() alone, as a chestnut's ModelState."""
+
+  prepare = send = end = None
+
+  def run(self, bufs, transforms, inputs, after_enqueue=None):
+    LinkModel.prepare(self, bufs, transforms, inputs)
+    LinkModel.send(self, after_enqueue is not None)
+    return LinkModel.end(self, after_enqueue)
+
+
+class WarmHandbackTest(JoiningBase):
+  """The warm hand-back (joining.WARM_QUIET): off by default, where the frame
+  path is main's; on, the small model runs the large model's frames
+  unpublished from the frame after the first held one, and a hand-back does
+  not reset it. Every hand-back on the drive of 2026-11-21 had 3 to 5 held
+  frames before it; a cold small model's first 4 frames planned 14 to 20 m/s
+  and jumped the steering command at three of them."""
+
+  def setUp(self):
+    super().setUp()
+    self.steps = []
+    self.small = HistoryModel(self.steps)
+    self.big = LinkModel(self.steps)
+    self.frame_no = 0
+
+  def _warm_state(self, warm=True, reset=True):
+    s = self._make(self.small, self._connect, self._build, reset_small=self.small.reset if reset else None,
+                   warm_handback=warm)
+    self.addCleanup(self._close, s)
+    self._wait_joined(s)
+    s.in_control = False
+    return s
+
+  def _frame(self, s, after_enqueue=None):
+    """One camera frame, numbered; returns its published output."""
+    self.frame_no += 1
+    return s.run({}, {}, {'frame': self.frame_no, 'vx': 5.0}, after_enqueue)
+
+  def _drive(self, s, n):
+    return [self._frame(s) for _ in range(n)]
+
+  def _swap(self, s):
+    self.assertEqual(self._frame(s)['from'], 'big')
+    self.assertTrue(s.chestnut)
+
+  def _hand_back_lag(self, s, held_from, n_held=model_state.HOLDS_IN_A_ROW):
+    """The large model holds `n_held` frames from its frame `held_from`; the
+    last one says it is behind, as model_state's 5-in-a-row rule does."""
+    self.big.held_at = set(range(held_from, held_from + n_held))
+    out = []
+    while self.big.calls < held_from + n_held:
+      if self.big.calls == held_from + n_held - 1:
+        self.big.behind = f'held {n_held} frames in a row'
+      out.append(self._frame(s))
+    self.big.behind = None
+    return out
+
+  # -- off: main's path ---------------------------------------------------------
+
+  def test_off_by_default_and_a_hand_back_resets_as_before(self):
+    s = self._warm_state(warm=False)
+    self.assertFalse(s._warm_handback)
+    self._swap(s)
+    self._drive(s, 10)
+    self._hand_back_lag(s, 11)
+    self.steps.clear()
+    self.assertEqual(self._frame(s)['from'], 'small')
+    # the reset, then the small model's frame: cold, as on main
+    self.assertEqual(self.steps, ['small reset', f'small run {self.frame_no}'])
+    self.assertEqual(self.small.history, [self.frame_no])
+    self.assertFalse(any('small run' in x for x in self.steps[:0]))
+    self.assertFalse(self.log.has('warm'))
+
+  def test_off_the_small_model_never_runs_while_the_large_one_drives(self):
+    s = self._warm_state(warm=False)
+    self._swap(s)
+    self.steps.clear()
+    self.big.held_at = {3, 4, 5}
+    self._drive(s, 12)
+    self.assertFalse(any(x.startswith('small') for x in self.steps))
+    # the large model's frames are whole: prepare, send, end in a row
+    self.assertEqual(self.steps[:3], ['big prepare 2', 'big send 2', 'big end 2'])
+
+  def test_off_is_main_call_for_call(self):
+    # the same frames through main's frame path (the code before the warm
+    # hand-back, as committed) and through this one with it off: the same
+    # calls in the same order, the same outputs, the same log lines
+    import importlib.util
+    import subprocess
+    src = subprocess.run(['git', 'show', '9be48b1:jetlink/openpilot/joining.py'], capture_output=True, text=True,
+                         cwd=Path(__file__).resolve().parents[2])
+    if src.returncode != 0:
+      self.skipTest('main (9be48b1) is not in this clone')
+    spec = importlib.util.spec_from_loader('joining_main', loader=None)
+    main = importlib.util.module_from_spec(spec)
+    main.__file__ = joining.__file__
+    exec(compile(src.stdout, 'joining_main.py', 'exec'), main.__dict__)   # noqa: S102
+    self.assertFalse(hasattr(main, 'WARM_QUIET'))
+
+    def trace(module, **kwargs):
+      steps = []
+      small, big = HistoryModel(steps), LinkModel(steps)
+      log = RecordingLog()
+      with mock.patch.object(module, 'SMALL_WARMUP_FRAMES', 0), mock.patch.object(module, 'REJOIN_DELAY_QUICK', 0.01):
+        s = module.JoiningModelState(small, self._connect, lambda c, sp: big, reset_small=small.reset,
+                                     progress=mock.Mock(), log=log, **kwargs)
+        try:
+          self.assertTrue(wait_for(lambda: s._joined is not None))
+          s.in_control = False
+          outs = []
+          frame = 0
+
+          def run(n):
+            nonlocal frame
+            for _ in range(n):
+              frame += 1
+              outs.append(s.run({}, {}, {'frame': frame, 'vx': 5.0}))
+
+          run(8)
+          big.held_at = {8, 9, 10, 11, 12}
+          big.behind = None
+          run(4)
+          big.behind = 'held 5 frames in a row'
+          run(1)
+          big.behind = None
+          run(6)    # the small model's, cold
+          self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+          run(3)    # swapped in again
+          big.fails, big.fails_at = RuntimeError('link gone'), big.calls + 1
+          run(4)    # lost on its second frame
+        finally:
+          s.close()
+          s._thread.join(5)
+      lines = [x for x in log.lines('warning') + log.lines('exception') if 'next attempt in' not in x
+               and 'built the large model state in' not in x and 'fallback frame' not in x]
+      return steps, [(o['from'], o.get('frame')) for o in outs], lines, s.handovers
+
+    before = trace(main)
+    after = trace(joining)
+    after_off = trace(joining, warm_handback=False)
+    self.assertEqual(before[0], after[0], 'the calls differ')
+    self.assertEqual(before[1], after[1], 'the published frames differ')
+    self.assertEqual(before[2], after[2], 'the log differs')
+    self.assertEqual(before[3], after[3])
+    self.assertEqual(after, after_off)
+    # and the trace is the one the test means: a cold reset at the hand-back
+    self.assertIn('small reset', before[0])
+
+  # -- on ----------------------------------------------------------------------
+
+  def test_from_the_frame_after_the_first_held_one_the_small_model_runs_unpublished(self):
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 9)
+    self.big.held_at = {10}
+    self.steps.clear()
+    out = self._frame(s)    # the large model's frame 10: held
+    self.assertEqual(out['from'], 'big')
+    self.assertFalse(any(x.startswith('small') for x in self.steps), 'held is known only once the frame ended')
+    self.steps.clear()
+    out = self._frame(s)    # the next: warm
+    n = self.frame_no
+    self.assertEqual(out['from'], 'big', 'a warm frame is never published')
+    self.assertEqual(out['frame'], n)
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', 'small reset', f'small run {n}', f'big end {n}'])
+    self.assertTrue(s.chestnut)
+    self.assertEqual(self.small.history, [n])
+    self.assertTrue(self.log.has('the small model is reset and runs from the next one unpublished'))
+
+  def test_after_the_hand_back_the_small_models_history_is_what_it_would_have_had(self):
+    # the drive's lag hand-backs: 5 held in a row. The small model ran the
+    # 4 frames after the first held one, and the hand-back frame is its 5th
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    first_held = self.frame_no + 1
+    self._hand_back_lag(s, self.big.calls)
+    resets = self.small.resets
+    out = self._frame(s)
+    self.assertEqual(out['from'], 'small')
+    self.assertEqual(self.small.resets, resets, 'not reset at the hand-back')
+    # every frame from the one after the first held one, each once, in order
+    self.assertEqual(self.small.history, list(range(first_held + 1, self.frame_no + 1)))
+    self.assertEqual(len(self.small.history), model_state.HOLDS_IN_A_ROW)
+    # past its cold block: the plan is the frame's, not the cold start's
+    self.assertEqual(float(out['plan'][0, 0, 3]), 5.0)
+    self.assertFalse(s.chestnut)
+    self.assertEqual(s.big_model_state, 'retrying')
+
+  def test_cold_without_a_held_frame_and_the_reset_is_as_before(self):
+    # a link that drops with no warning frame (none did that drive): cold
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    self.big.fails, self.big.fails_at = RuntimeError('link gone'), self.big.calls
+    self.steps.clear()
+    out = self._frame(s)
+    n = self.frame_no
+    self.assertEqual(out['from'], 'small')
+    self.assertEqual(self.steps, [f'big prepare {n}', f'big send {n}', f'big end {n}', 'small reset', f'small run {n}'])
+    self.assertEqual(self.small.history, [n])
+
+  def test_a_lost_link_after_held_frames_publishes_the_warm_run_of_its_frame(self):
+    # b6 00:30.6 and b7 01:57.5: 4 frames with no answer, then the 0.2 s
+    # deadline. Here the deadline lands in end(), after the small model ran
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    k = self.big.calls
+    self.big.held_at = {k, k + 1, k + 2}
+    self._drive(s, 3)
+    self.big.fails, self.big.fails_at = RuntimeError('no answer for frame in 0.2s'), self.big.calls
+    small_calls = self.small.calls
+    out = self._frame(s)
+    self.assertEqual(out['from'], 'small')
+    self.assertEqual(out['frame'], self.frame_no)
+    self.assertEqual(self.small.calls, small_calls + 1, 'the frame is not run twice')
+    self.assertEqual(self.small.history, list(range(self.frame_no - 2, self.frame_no + 1)))
+    self.assertEqual(self.small.history.count(self.frame_no), 1)
+    self.assertTrue(self.log.has("its warm output is this frame's"))
+
+  def test_a_send_that_fails_while_warm_runs_the_frame_published(self):
+    # infer_begin's 0.2 s deadline is in send(), before the small model ran
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    k = self.big.calls
+    self.big.held_at = {k, k + 1, k + 2}
+    self._drive(s, 3)
+    self.big.fails, self.big.fails_at, self.big.fails_on_send = LinkError('no answer to 4 frames'), self.big.calls, True
+    resets = self.small.resets
+    out = self._frame(s)
+    self.assertEqual(out['from'], 'small')
+    self.assertEqual(self.small.resets, resets, 'warm: not reset')
+    self.assertEqual(self.small.history, list(range(self.frame_no - 2, self.frame_no + 1)))
+
+  def test_a_warm_run_that_fails_never_reaches_the_large_models_frame(self):
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self.small.raises = RuntimeError('small model fault')
+    self.steps.clear()
+    out = self._frame(s)
+    n = self.frame_no
+    self.assertEqual(out['from'], 'big', "the large model's frame is published as ever")
+    self.assertEqual(self.steps[-1], f'big end {n}', 'and collected')
+    self.assertTrue(s.chestnut)
+    self.assertTrue(self.log.has('the small model\'s warm-up is off until the next swap: its warm run failed'))
+    self.assertEqual(len(self.log.lines('exception')), 1)
+    # off for the swap: no more warm runs, and the hand-back resets
+    self.small.raises = None
+    self.steps.clear()
+    self._hand_back_lag(s, self.big.calls)
+    self.assertFalse(any(x.startswith('small') for x in self.steps))
+    self.steps.clear()
+    self.assertEqual(self._frame(s)['from'], 'small')
+    self.assertEqual(self.steps, ['small reset', f'small run {self.frame_no}'])
+    self._drive(s, joining.WARM_LOGGED - 1)
+    self.assertTrue(self.log.has('cold, reset at the hand-back (warm-up off: its warm run failed)'))
+
+  def test_a_warm_run_past_the_budget_turns_it_off_for_the_swap(self):
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    clock = [100.0]
+
+    def run(bufs, transforms, inputs, after_enqueue=None, run=self.small.run):
+      clock[0] += joining.WARM_FRAME_BUDGET + 0.004
+      return run(bufs, transforms, inputs, after_enqueue)
+
+    with mock.patch.object(joining.time, 'monotonic', lambda: clock[0]), \
+         mock.patch.object(self.small, 'run', run):
+      out = self._frame(s)
+    self.assertEqual(out['from'], 'big')
+    self.assertTrue(self.log.has('past the 46 ms budget'))
+    self.assertFalse(s._warming)
+    self.assertIsNotNone(s._warm_off)
+
+  def test_the_large_models_wait_is_its_own_deadline_from_its_warp(self):
+    # the real JetlinkModelState: its hold is HOLD_FRAME from its warp's
+    # start, so the small model's run comes out of the wait, not on top of it
+    from tests.openpilot.test_model_state import FakeClient as LinkClient
+    from tests.openpilot.test_model_state import FakeWarp as LinkWarp
+    from tests.openpilot.test_model_state import spec_for as link_spec
+    from tests.openpilot.test_model_state import STATEFUL as LINK_INPUTS
+    spec = link_spec(LINK_INPUTS)
+    client = LinkClient()
+    client.close = lambda: None
+    real = model_state.JetlinkModelState(client, spec, LinkWarp(np.zeros(np.prod(spec.warped_shape), np.uint8)),
+                                         face=fakes.FACE, log=self.log, event=lambda *a, **k: None)
+    small_ran = []
+
+    def small_run(bufs, transforms, inputs, after_enqueue=None):
+      small_ran.append(time.perf_counter())
+      time.sleep(0.02)   # 20 ms of small model
+      return {'from': 'small'}
+
+    self.small.run = small_run
+    self.big = real
+    s = self._warm_state()
+    bufs = {k: SimpleNamespace(data=np.zeros(8, np.uint8)) for k in ('img', 'big_img')}
+    inputs = {'desire_pulse': np.zeros(8, np.float32), 'traffic_convention': np.array([1, 0], np.float32),
+              'action_t': np.array([0.1, 0.2], np.float32)}
+    args = (bufs, {'img': np.eye(3), 'big_img': np.eye(3)}, inputs)
+    s.run(*args)    # the swap
+    client.late.add(2)
+    s.run(*args)    # frame 2: held (its reply never comes in time)
+    self.assertTrue(real.held)
+    client.late.add(3)
+    s.run(*args)    # frame 3: warm, held
+    self.assertEqual(len(small_ran), 1)
+    hold = client.holds[-1]
+    # what end() waited: HOLD_FRAME less the warp, the send and the 20 ms the small model took
+    self.assertLess(hold, model_state.HOLD_FRAME - 0.018)
+    self.assertGreater(hold, 0.0)
+
+  def test_quiet_frames_end_the_warm_up_and_the_next_held_one_resets_afresh(self):
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self._drive(s, joining.WARM_QUIET)
+    self.assertFalse(s._warming)
+    self.assertTrue(self.log.has(f'answered {joining.WARM_QUIET} frames in time; the small model stops warming'))
+    self.steps.clear()
+    self._drive(s, 5)
+    self.assertFalse(any(x.startswith('small') for x in self.steps))
+    # a held frame again: reset, warm from the next
+    self.big.held_at = {self.big.calls}
+    self._frame(s)
+    self.steps.clear()
+    self._frame(s)
+    self.assertIn('small reset', self.steps)
+    self.assertEqual(self.small.history, [self.frame_no])
+
+  def test_a_hand_back_on_the_first_held_frames_heels_is_cold(self):
+    # b8: one held frame, at frame 4 of the proof, handed back at once
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 2)
+    self.big.held_at = {self.big.calls}
+    self.big.behind = 'held frame 4 of the first 20'
+    self._frame(s)
+    self.big.behind = None
+    self.steps.clear()
+    self.assertEqual(self._frame(s)['from'], 'small')
+    self.assertEqual(self.steps, ['small reset', f'small run {self.frame_no}'])
+
+  def test_the_record_says_warm_or_cold_and_the_plans(self):
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    self._hand_back_lag(s, self.big.calls)
+    for _ in range(joining.WARM_LOGGED):
+      self._frame(s)
+    line = next(x for x in self.log.lines('warning') if 'hand-back record' in x)
+    self.assertIn('hand-back record (jetlink fell behind): the small model was warm, not reset: 4 frames', line)
+    # what a cold start would have published, and what was
+    self.assertIn('its first warm frames planned 16.0->16.0 m/s', line)
+    self.assertIn('Its first 4 published frames planned 5.0->5.0 m/s', line)
+    self.assertIn("the large model's last frame 7.0->7.0 m/s", line)
+    # and cold, the next time, without a warm-up
+    self.assertTrue(wait_for(lambda: s._joined is not None, 5))
+    self._swap(s)
+    self._drive(s, 3)
+    self.big.fails, self.big.fails_at = RuntimeError('link gone'), self.big.calls
+    for _ in range(joining.WARM_LOGGED):
+      self._frame(s)
+    lines = [x for x in self.log.lines('warning') if 'hand-back record' in x]
+    self.assertEqual(len(lines), 2)
+    self.assertIn('the small model was cold, reset at the hand-back. Its first 4 published frames planned '
+                  '16.0->16.0 m/s', lines[1])
+
+  def test_a_large_model_that_does_not_split_its_frame_is_never_warmed(self):
+    self.big = WholeModel(self.steps)
+    s = self._warm_state()
+    self._swap(s)
+    self._drive(s, 10)
+    self.steps.clear()
+    self._hand_back_lag(s, self.big.calls)
+    self.assertFalse(any(x.startswith('small') for x in self.steps))
+    self.steps.clear()
+    self._frame(s)
+    self.assertEqual(self.steps[0], 'small reset')
+
+  def test_without_a_reset_it_stays_off(self):
+    s = self._warm_state(reset=False)
+    self.assertFalse(s._warm_handback)
+    self.assertTrue(self.log.has('no reset of the small model to warm it from'))
+
+  def test_the_adapters_switch(self):
+    log = RecordingLog()
+    self.assertFalse(joining.warm_handback(SimpleNamespace(), log))
+    self.assertFalse(joining.warm_handback(SimpleNamespace(warm_handback=lambda: False), log))
+    self.assertFalse(joining.warm_handback(SimpleNamespace(warm_handback=lambda: None), log))
+    self.assertEqual(log.lines('error') + log.lines('exception'), [])
+    self.assertFalse(joining.warm_handback(SimpleNamespace(warm_handback=lambda: 1), log))
+    self.assertEqual(len(log.lines('error')), 1)
+
+    def broken():
+      raise KeyError('JetlinkWarmHandback')
+
+    self.assertFalse(joining.warm_handback(SimpleNamespace(warm_handback=broken), log))
+    self.assertEqual(len(log.lines('exception')), 1)
+    self.assertTrue(joining.warm_handback(SimpleNamespace(warm_handback=lambda: True), log))
+    self.assertTrue(log.has('kept warm for a hand-back', 'warning'))
+
+  def test_the_frame_thread_alone_touches_the_warm_state(self):
+    # nothing the join or writer threads run reads or writes it
+    import inspect
+    threads = (joining.JoiningModelState._join_loop, joining.JoiningModelState._keep_alive,
+               joining.JoiningModelState._write_loop, joining.JoiningModelState._runtime,
+               joining.JoiningModelState._close_retired, joining.JoiningModelState._note_link_loss,
+               joining.JoiningModelState._back_off)
+    for fn in threads:
+      src = inspect.getsource(fn)
+      for name in ('_warming', '_warm ', '_warm=', '_quiet', '_cold', '_first_points', '_last_points', '_warm_off'):
+        self.assertNotIn(name, src, f'{fn.__name__} touches {name}')
+
 
 if __name__ == '__main__':
   unittest.main()

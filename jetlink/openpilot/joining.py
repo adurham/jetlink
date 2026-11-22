@@ -281,7 +281,7 @@ class JoiningModelState:
     self._big_point = None
     self._first_points: list = []
     self._last_points: deque = deque(maxlen=WARM_LOGGED)
-    self._warm_ms = [0.0, 0.0, 0.0]
+    self._warm_ms = [0.0, 0.0, 0.0, 0.0]
     self._reset_s = 0.0
     if warm_handback and reset_small is None:
       log.warning("jetlink: no reset of the small model to warm it from; every hand-back starts it cold")
@@ -524,6 +524,7 @@ class JoiningModelState:
     small, into = warmed - sent - self._reset_s, warmed - started - self._reset_s
     t = self._warm_ms
     t[0], t[1], t[2] = max(t[0], small * 1e3), max(t[1], into * 1e3), max(t[2], (done - started) * 1e3)
+    t[3] = max(t[3], self._reset_s * 1e3)
     if into > WARM_FRAME_BUDGET:
       self._log.warning("jetlink: the small model's warm run ended %.1f ms into the frame, past the %.0f ms budget "
                         "(large model out %.1f, small model %.1f, reset %.1f ms)", into * 1e3,
@@ -545,7 +546,7 @@ class JoiningModelState:
       self._quiet = 0
       if not self._warming and self._warm_off is None:
         self._warming, self._warm = True, 0
-        self._warm_ms = [0.0, 0.0, 0.0]
+        self._warm_ms = [0.0, 0.0, 0.0, 0.0]
         self._first_points, self._last_points = [], deque(maxlen=WARM_LOGGED)
         self._log.warning("jetlink: the large model held a frame; the small model is reset and runs from the next "
                           "one unpublished, warm for a hand-back")
@@ -554,7 +555,7 @@ class JoiningModelState:
       if self._quiet >= WARM_QUIET:
         self._log.warning("jetlink: the large model answered %d frames in time; the small model stops warming after "
                           "%d frames (small model up to %.1f ms, done up to %.1f ms into the frame, frame up to "
-                          "%.1f ms)", self._quiet, self._warm, *self._warm_ms)
+                          "%.1f ms, reset %.1f ms)", self._quiet, self._warm, *self._warm_ms)
         self._warming, self._warm, self._quiet = False, 0, 0
 
   def _demote_warm(self, why: str) -> None:
@@ -589,8 +590,9 @@ class JoiningModelState:
       return
     self._cold = None
     if cold['warm']:
-      how = (f"warm, not reset: {cold['warm']} frames run unpublished (small model up to {cold['ms'][0]:.1f} ms, "
-             f"done up to {cold['ms'][1]:.1f} ms into the frame, frame up to {cold['ms'][2]:.1f} ms); its first warm "
+      ms = cold['ms']
+      how = (f"warm, not reset: {cold['warm']} frames run unpublished (small model up to {ms[0]:.1f} ms, done up to "
+             f"{ms[1]:.1f} ms into the frame, frame up to {ms[2]:.1f} ms, its reset {ms[3]:.1f} ms); its first warm "
              f"frames planned {said_points(cold['first'])}, its last {said_points(cold['last'])}")
     else:
       how = 'cold, reset at the hand-back' + (f" (warm-up off: {cold['off']})" if cold['off'] else '')
