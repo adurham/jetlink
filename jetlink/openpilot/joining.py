@@ -40,6 +40,23 @@ Two rules the swap keeps:
   every frame whether anything is in control (in_control), from openpilot's
   own messages; standstill alone is not enough, longitudinal control may still
   hold the brake.
+
+One exception, off unless the adapter asks for it (ModelSide.mid_drive_window):
+a fork whose lateral-only mode (MADS) stays enabled after a cancel is "in
+control" for whole drives, so a link that falls back mid-drive would otherwise
+never rejoin until the driver turns everything off. With the window on, a link
+that is ready may still swap in on a frame where nothing the model outputs
+reaches an actuator: the adapter says so for REJOIN_FRAMES frames running (a
+held stop, openpilot itself disengaged, its lateral and longitudinal control
+both inactive, no override, no alert), the link has been ready REJOIN_READY_S
+with its keepalive answering, and the small model's own plan is stationary.
+The large model's first frame must then continue the small model's last
+(REJOIN_PLAN_DV, REJOIN_PLAN_DY) or it is not published: the small model runs
+that frame and keeps driving, its history untouched, and the window stays shut
+until the small model's plan has set off again (one try per stop: each try
+costs modeld the large model's slow first frame). Openpilot holding the car at
+a stop is still in control and never a window: its longitudinal plan decides
+when the car moves.
 """
 from __future__ import annotations
 
@@ -48,6 +65,8 @@ import os
 import threading
 import time
 from collections import deque
+
+import numpy as np
 
 from jetlink import protocol as P
 from jetlink.comma import gadget
@@ -109,6 +128,9 @@ BAD_OUTPUT = 'jetlink output not finite'
 SMALL_READS = ('desire_key', 'numpy_inputs')
 # why a built model was let go before it drove
 NOT_UP = 'could not bring up the large model'
+# and why one that swapped in mid-drive was let go on its first frame, unpublished
+# (the mid-drive window, below)
+DISCONTINUOUS = 'jetlink plan did not continue'
 # and as the leave says it to the server (protocol.Msg.LEAVE)
 LEAVING = {LOST: P.LEAVE_LOST, BEHIND: P.LEAVE_BEHIND}
 # the demotes that count as lag, which says nothing about the cable
@@ -117,7 +139,8 @@ LAGS = (BEHIND, BAD_OUTPUT)
 # `why` of its progress code (status.PROGRESS_CODES 'reconnecting')
 RECONNECTING = {LOST: ('reconnecting', 'lost'), BEHIND: ('fell behind, reconnecting', 'behind'),
                 NOT_UP: ('load failed, reconnecting', 'load_failed'),
-                BAD_OUTPUT: ('bad output, reconnecting', 'bad_output')}
+                BAD_OUTPUT: ('bad output, reconnecting', 'bad_output'),
+                DISCONTINUOUS: ('plan did not continue, reconnecting', 'discontinuous')}
 # how long a model name the comma's index did not have stays the sha's
 NAME_RETRY = 30.0
 # The warm hand-back (JoiningModelState(warm_handback=True); off by default,
@@ -175,6 +198,77 @@ def said_points(points) -> str:
   """Plans as the record says them: speed now and 2.2 s ahead, lateral position 2.2 s ahead."""
   return '; '.join('no plan' if p is None else f'{p[0]:.1f}->{p[1]:.1f} m/s y {p[2]:+.2f} m' for p in points) or 'none'
 
+# -- the mid-drive window (mid_drive_window), unused without one ----------------
+# frames running the adapter must say nothing the model outputs reaches an
+# actuator before a swap lands with something in control: a second at 20 Hz,
+# so a stop that is only a slow roll through, or a flag that flickers, is not one
+REJOIN_FRAMES = 20
+# how long the link has been ready first, and how many keepalive answers it has
+# given since, every REJOIN_PING_PERIOD while it waits. A link that fell back
+# for lag is back as ready a second later (REJOIN_DELAY_QUICK) over the same
+# host; this is the least it must stay up and answering before it may drive
+# with something in control
+REJOIN_READY_S = 2.0
+REJOIN_PINGS = 2
+REJOIN_PING_PERIOD = 1.0
+# and the newest of those answers no older than this at the swap: a period and
+# a ping's timeout less a margin
+REJOIN_PING_FRESH = 2.5
+# the plans are compared over their first REJOIN_HORIZON_S, as modeld parses
+# them: outputs['plan'], (1, IDX_N, PLAN_WIDTH) over T_IDXS = 10 (i / 32)^2 s,
+# lateral position at PLAN_Y and forward speed at PLAN_VX (openpilot's
+# modeld.constants.Plan: POSITION 0:3, VELOCITY 3:6)
+REJOIN_HORIZON_S = 2.0
+PLAN_IDX_N = 33
+PLAN_Y = 1
+PLAN_VX = 3
+REJOIN_HORIZON = sum(1 for i in range(PLAN_IDX_N) if 10.0 * (i / (PLAN_IDX_N - 1)) ** 2 <= REJOIN_HORIZON_S)
+# the small model's plan is stationary: never faster than this over the horizon,
+# in m/s. A plan that sets off is a car about to move, not a stop to swap in
+REJOIN_PLAN_SPEED = 0.5
+# the large model's first plan continues the small model's last: speeds within
+# REJOIN_PLAN_DV m/s and lateral positions within REJOIN_PLAN_DY m, point by
+# point over the horizon. At a held stop both plans are a car that stays put
+REJOIN_PLAN_DV = 0.5
+REJOIN_PLAN_DY = 0.5
+
+
+def plan_of(outputs) -> np.ndarray | None:
+  """The first REJOIN_HORIZON points of the plan in a model's parsed outputs,
+  (REJOIN_HORIZON, PLAN_WIDTH), or None for outputs without a finite one of
+  the shape modeld parses: nothing to compare is no proof. A copy: what
+  modeld does with the outputs after run() cannot reach it."""
+  try:
+    plan = np.array(outputs['plan'], dtype=np.float64)
+  except Exception:
+    return None
+  if plan.ndim == 3 and plan.shape[0] == 1:
+    plan = plan[0]
+  if plan.ndim != 2 or plan.shape[0] != PLAN_IDX_N or plan.shape[1] <= PLAN_VX:
+    return None
+  plan = plan[:REJOIN_HORIZON]
+  return plan if np.isfinite(plan).all() else None
+
+
+def stationary(plan) -> bool:
+  """Does this plan (plan_of) keep the car where it is: never faster than
+  REJOIN_PLAN_SPEED over the horizon? No plan is not a stop."""
+  return plan is not None and float(np.abs(plan[:, PLAN_VX]).max()) <= REJOIN_PLAN_SPEED
+
+
+def discontinuity(before, after) -> str | None:
+  """Why the plan `after` (plan_of) does not continue `before`, the frame just
+  ahead of it, or None when it does: speeds within REJOIN_PLAN_DV and lateral
+  positions within REJOIN_PLAN_DY, point by point over the horizon."""
+  a, b = before, after
+  if a is None or b is None:
+    return 'no plan to compare'
+  dv = float(np.abs(b[:, PLAN_VX] - a[:, PLAN_VX]).max())
+  dy = float(np.abs(b[:, PLAN_Y] - a[:, PLAN_Y]).max())
+  if dv > REJOIN_PLAN_DV or dy > REJOIN_PLAN_DY:
+    return f"speed {dv:.2f} m/s and lateral position {dy:.2f} m off"
+  return None
+
 
 class JoiningModelState:
   """Duck-types openpilot's modeld ModelState, with a second one inside.
@@ -183,10 +277,13 @@ class JoiningModelState:
   `log` is cloudlog on a comma, and `in_control` the adapter's, asked before
   every frame; without one, the in_control last written stands. `name` is
   the catalog's name for a model's sha256, for the runtime record.
+  `rejoin` is the adapter's mid-drive window (Openpilot.mid_drive_window),
+  asked before every frame on which a ready link waits with something in
+  control; without one, as by default, the swap waits for nothing in control.
   """
 
   def __init__(self, small, connect, build, prepare=None, reset_small=None, *, progress, log, in_control=None,
-               name=None, warm_handback=False):
+               name=None, warm_handback=False, rejoin=None):
     self._small = small
     self._active = small
     self._connect = connect
@@ -255,6 +352,22 @@ class JoiningModelState:
     self._in_control = True
     self._ask_in_control = in_control
     self._stop = threading.Event()
+
+    # the mid-drive window, all of it unused without `rejoin`: the frames
+    # running it has said yes on, when the waiting link became ready, its
+    # keepalive answers since and the newest one's time (the join thread's),
+    # the small model's last plan (plan_of), which a swap in it must
+    # continue, whether the swap being made is one, whether this stop has
+    # had its try, and the window's last error, said once
+    self._ask_rejoin = rejoin
+    self._rejoin_run = 0
+    self._ready_at = 0.0
+    self._pings = 0
+    self._pinged_at = 0.0
+    self._small_plan = None
+    self._mid_drive = False
+    self._stop_tried = False
+    self._rejoin_error: str | None = None
 
     # whether the large model has produced a frame; a first inference that
     # fails never announces readiness. Travels in modelV2.big and
@@ -419,13 +532,60 @@ class JoiningModelState:
       self._log.warning("jetlink: modeld dropped %.2f %% of camera frames behind the large model, "
                         "the small model drives from this one", self._frame_drop_ratio * 100)
       self._demote(BEHIND)
+    if self._ask_rejoin is not None:
+      self._count_rejoin()
     self._maybe_swap()
     if self._active is self._small:
       self._small_frames += 1
       if self._cold is not None:
         return self._run_small_recorded(bufs, transforms, inputs, after_enqueue)
-      return self._small.run(bufs, transforms, inputs, after_enqueue)
+      return self._run_small(bufs, transforms, inputs, after_enqueue)
     return self._run_big(bufs, transforms, inputs, after_enqueue)
+
+  def _run_small(self, bufs, transforms, inputs, after_enqueue):
+    """The small model's frame. With a mid-drive window its plan is kept,
+    read before the small model runs again: a swap on the next frame must
+    continue it, and a plan that sets off ends the stop that had its try."""
+    result = self._small.run(bufs, transforms, inputs, after_enqueue)
+    if self._ask_rejoin is not None:
+      self._small_plan = plan_of(result)
+      if self._stop_tried and not stationary(self._small_plan):
+        self._stop_tried = False
+    return result
+
+  def _count_rejoin(self) -> None:
+    """The frames running the mid-drive window has said yes on. Asked only
+    while it could matter: a link ready and waiting, the small model driving,
+    something in control. Anything else, a no or a window that raises,
+    starts the count again."""
+    ask = self._ask_rejoin
+    if ask is None or not (self._in_control and self._available and self._active is self._small):
+      self._rejoin_run = 0
+      return
+    try:
+      ok = ask() is True
+    except Exception as e:
+      # once per distinct error: this runs 20 times a second
+      if self._rejoin_error != (text := f"{type(e).__name__}: {e}"):
+        self._rejoin_error = text
+        self._log.exception("jetlink: the mid-drive window failed, counted as closed")
+      self._rejoin_run = 0
+      return
+    self._rejoin_error = None
+    self._rejoin_run = self._rejoin_run + 1 if ok else 0
+
+  def _mid_drive_open(self) -> bool:
+    """May a ready link swap in with something in control, on this frame?
+    The adapter has said for REJOIN_FRAMES frames running that nothing the
+    model outputs reaches an actuator, the link has been ready
+    REJOIN_READY_S and answered REJOIN_PINGS keepalives since, the newest
+    within REJOIN_PING_FRESH, the small model's last plan keeps the car where
+    it is, and this stop has not had its try."""
+    if self._ask_rejoin is None or self._rejoin_run < REJOIN_FRAMES or self._stop_tried:
+      return False
+    now = time.monotonic()
+    return (now - self._ready_at >= REJOIN_READY_S and self._pings >= REJOIN_PINGS
+            and now - self._pinged_at <= REJOIN_PING_FRESH and stationary(self._small_plan))
 
   def _run_big(self, bufs, transforms, inputs, after_enqueue):
     big = self._big
@@ -436,6 +596,12 @@ class JoiningModelState:
       result = big.run(bufs, transforms, inputs, after_enqueue)
     except Exception as e:
       return self._fall_back(e, bufs, transforms, inputs, started)
+    if self._mid_drive:
+      # the first frame of a swap with something in control: published only
+      # if it continues the small model's last
+      self._mid_drive = False
+      if (why := discontinuity(self._small_plan, plan_of(result))) is not None:
+        return self._unswap(why, bufs, transforms, inputs)
     if self._warm_handback:
       self._noted(big, result)
     return self._ran_big(big, result)
@@ -459,7 +625,7 @@ class JoiningModelState:
     # re-run the frame rather than propagate: modeld's fallback is permanent,
     # this one is retryable. after_enqueue is dropped, the large model may
     # already have called it
-    result = self._small.run(bufs, transforms, inputs, None)
+    result = self._run_small(bufs, transforms, inputs, None)
     # all of it is one modeld frame, 42 to 107 ms measured with the small
     # model warm. The dropped camera frames are forgiven
     # (modeld sees the model change), but the log should say which part it was
@@ -646,7 +812,10 @@ class JoiningModelState:
     Its first frame resets the host's history. A build that fails is backed
     off like a demote, or one that fails the same way every time is a connect
     and a build per second for the drive."""
-    if self._joined is None or self._in_control or self._small_frames < SMALL_WARMUP_FRAMES:
+    if self._joined is None or self._small_frames < SMALL_WARMUP_FRAMES:
+      return
+    mid_drive = self._in_control
+    if mid_drive and not self._mid_drive_open():
       return
     with self._lock:
       joined, self._joined = self._joined, None
@@ -654,6 +823,9 @@ class JoiningModelState:
         self._available = False
     if joined is None:
       return
+    if mid_drive:
+      # this stop's one try, whatever comes of it
+      self._stop_tried = True
     client, spec = joined
     try:
       t0 = time.monotonic()
@@ -679,14 +851,42 @@ class JoiningModelState:
       self._warm_off = None if split else "the large model's frame is not split (prepare, send, end)"
       self._cold, self._big_point = None, None
       self._first_points, self._last_points = [], deque(maxlen=WARM_LOGGED)
+    self._mid_drive = mid_drive
+    self._rejoin_run = 0
+    if mid_drive:
+      self._log.warning("jetlink: swapping the large model in mid-drive: nothing in control acts on the model now")
+
+  def _unswap(self, why: str, bufs, transforms, inputs):
+    """A mid-drive swap whose first frame does not continue the small model's
+    last: that frame is not published. The small model runs it and drives
+    on, its history untouched, as it has missed no frame; the large model
+    state goes as one that would not come up, its live link kept for the
+    next window, and backed off. Two handovers in one run(), so modeld
+    forgives the frame's stall, and modelV2.big never says it drove.
+    after_enqueue is dropped, as at a failure: the large model may have
+    called it."""
+    self._log.warning("jetlink: the large model's first plan mid-drive does not continue the small model's (%s); "
+                      "the small model drives on", why)
+    big, self._big = self._big, None
+    with self._lock:
+      self._retired = (big, DISCONTINUOUS)
+    self._back_off()
+    self._active = self._small
+    self._handed_over()
+    self._loading = True
+    return self._run_small(bufs, transforms, inputs, None)
 
   def _demote(self, why: str) -> None:
     """Back to the small model, from a reset history. On the frame thread, so
     nothing here waits: the join thread reads the port, reports and closes
     the link, moments later. Counted as a lost link or a hand-back for lag,
     and backed off. With the warm hand-back on, a small model that warmed
-    through the large model's last frames is not reset (_demote_warm)."""
+    through the large model's last frames is not reset (_demote_warm). The
+    first frame of a mid-drive swap is the one frame the small model did not
+    run: its history is whole and is kept, so the stop goes on with the plan
+    it had."""
     big, self._big = self._big, None
+    first_mid_drive, self._mid_drive = self._mid_drive, False
     if why in LAGS:
       self._lags += 1
     else:
@@ -699,7 +899,7 @@ class JoiningModelState:
     self._loading = True
     if self._warm_handback:
       self._demote_warm(why)
-    elif self._reset_small is not None:
+    elif self._reset_small is not None and not first_mid_drive:
       self._reset_small()
 
   def _handed_over(self) -> None:
@@ -850,6 +1050,9 @@ class JoiningModelState:
         if self._stop.is_set():
           client.close()
           return
+        # the open was a round trip: the mid-drive window counts from here
+        self._ready_at = self._pinged_at = time.monotonic()
+        self._pings = 0
         self._available = True
         self._joined = (client, spec)
       self._log.warning("jetlink: link ready, waiting for a window to swap")
@@ -884,7 +1087,9 @@ class JoiningModelState:
     frame loop sees a whole one or none, and never waits on the lock.
     """
     while not self._stop.is_set():
-      if self._rejoin.wait(KEEPALIVE_PERIOD):
+      # every KEEPALIVE_PERIOD, or REJOIN_PING_PERIOD with a mid-drive window:
+      # its swap waits on answers given lately
+      if self._rejoin.wait(REJOIN_PING_PERIOD if self._ask_rejoin is not None else KEEPALIVE_PERIOD):
         return
       with self._lock:
         joined, self._joined = self._joined, None
@@ -905,6 +1110,8 @@ class JoiningModelState:
       with self._lock:
         stopped = self._stop.is_set()
         if not stopped:
+          self._pinged_at = time.monotonic()
+          self._pings += 1
           self._joined = joined
       if stopped:
         # close() ran during the ping and found nothing to close
@@ -1053,7 +1260,8 @@ def join(parts, cam_w: int, cam_h: int, small) -> JoiningModelState:
 
   return JoiningModelState(small, connect, build, prepare, reset_small=lambda: ready['reset_small'](),
                            progress=parts.progress, log=parts.log, in_control=op.in_control,
-                           name=parts.models.name_for, warm_handback=warm_handback(op, parts.log))
+                           name=parts.models.name_for, warm_handback=warm_handback(op, parts.log),
+                           rejoin=mid_drive_window(op, parts.log))
 
 
 def warm_handback(op, log) -> bool:
@@ -1074,3 +1282,27 @@ def warm_handback(op, log) -> bool:
     return False
   log.warning("jetlink: the small model is kept warm for a hand-back (warm_handback)")
   return True
+
+
+def mid_drive_window(op, log):
+  """The adapter's mid-drive window (ModelSide.mid_drive_window), asked once,
+  on modeld's main thread: None, as without the member, keeps the swap
+  waiting for nothing in control. So does one that raises or is not
+  callable: the window is the adapter's opt-in, and a broken one is no
+  opt-in, never a reason to lose the link."""
+  ask = getattr(op, 'mid_drive_window', None)
+  if ask is None:
+    return None
+  try:
+    window = ask()
+  except Exception:
+    log.exception("jetlink: the adapter's mid_drive_window failed; the swap waits for nothing in control")
+    return None
+  if window is None:
+    return None
+  if not callable(window):
+    log.error("jetlink: the adapter's mid_drive_window gave %r, not a callable; the swap waits for nothing in control",
+              window)
+    return None
+  log.warning("jetlink: the large model may also swap in mid-drive, where the adapter's window says")
+  return window
