@@ -1664,7 +1664,8 @@ class WarmHandbackTest(JoiningBase):
     src = subprocess.run(['git', 'show', '9be48b1:jetlink/openpilot/joining.py'], capture_output=True, text=True,
                          cwd=Path(__file__).resolve().parents[2])
     if src.returncode != 0:
-      self.skipTest('main (9be48b1) is not in this clone')
+      # a missing main is a broken checkout, not a reason to skip the parity check: this test IS the comparison
+      self.fail('main (9be48b1) is not in this clone: cannot compare the frame paths')
     spec = importlib.util.spec_from_loader('joining_main', loader=None)
     main = importlib.util.module_from_spec(spec)
     main.__file__ = joining.__file__
@@ -1933,7 +1934,8 @@ class WarmHandbackTest(JoiningBase):
     for _ in range(joining.WARM_LOGGED):
       self._frame(s)
     line = next(x for x in self.log.lines('warning') if 'hand-back record' in x)
-    self.assertIn('hand-back record (jetlink fell behind): the small model was warm, not reset: 4 frames', line)
+    self.assertIn(f'hand-back record (jetlink fell behind): the small model was warm, not reset: '
+                  f'{model_state.HOLDS_IN_A_ROW - 1} frames', line)
     # what a cold start would have published, and what was
     self.assertIn('its first warm frames planned 16.0->16.0 m/s', line)
     self.assertIn('Its first 4 published frames planned 5.0->5.0 m/s', line)
