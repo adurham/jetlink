@@ -409,6 +409,25 @@ final class Session: @unchecked Sendable {
       )
     }
     host.frameStats.record(totalUs: reply.totalUs, gpuUs: reply.gpuUs, queueUs: reply.queueUs, sendUs: sendUs)
+    sendStamps(reply, received: message.receivedAt, sentUs: sendUs)
+  }
+
+  /// FRAME_STAMPS: what this end measured of the frame that just answered, on
+  /// its own clock, keyed by the id the comma sent. After the reply and after
+  /// its bookkeeping, so it is never in the frame's way; a failure costs the
+  /// comma's latency record and nothing else.
+  private func sendStamps(_ reply: InferReply, received: UInt64, sentUs: UInt32) {
+    guard reply.wantsStamps else { return }
+    // the request's arrival to the inference starting: stamped at the read, so
+    // this holds the wait for the host lock, a build's or a status call's
+    let waited = reply.startedAt > received ? reply.startedAt - received : 0
+    let queueUs = UInt32(min(UInt64(UInt32.max), waited / 1000))
+    let payload = Wire.frameStamps(frameID: reply.frameID, queueUs: queueUs, inferUs: reply.totalUs, sendUs: sentUs)
+    do {
+      try transport.send(.frameStamps, seq: 0, data: [Data(payload)])
+    } catch {
+      log.debug("could not send the stamps for frame \(reply.frameID): \(error)")
+    }
   }
 
   /// What an INFER_RESP says; the outputs are in `outputBuffer`.
@@ -418,11 +437,16 @@ final class Session: @unchecked Sendable {
     var gpuUs: UInt32 = 0
     var queueUs: UInt32 = 0
     var totalUs: UInt32 = 0
+    /// When the inference began, on the clock `receivedAt` is on: the wait for
+    /// the host lock and the request's parse are the frame's queue (FRAME_STAMPS).
+    var startedAt: UInt64 = 0
     /// Floats of `outputBuffer` the reply carries, 0 for none.
     var outputCount = 0
     /// Left out of those, unless the comma asked for them.
     var hidden: Range<Int>?
     var wantsState = false
+    /// The comma asked for FRAME_STAMPS after this reply.
+    var wantsStamps = false
     /// The model ran, so the frame counts and is timed.
     var ran = false
     /// Why it failed, when it did.
@@ -518,8 +542,9 @@ final class Session: @unchecked Sendable {
     let replied = status == .ok || status == .notFinite
     return InferReply(
       frameID: frameID, status: status, gpuUs: loaded.engine.lastGpuUs, queueUs: queueUs, totalUs: microseconds(since: started),
-      outputCount: replied ? count : 0, hidden: replied && !flags.contains(.wantHidden) ? layout.hidden : nil,
-      wantsState: flags.contains(.wantState), ran: true, failure: failure)
+      startedAt: started, outputCount: replied ? count : 0,
+      hidden: replied && !flags.contains(.wantHidden) ? layout.hidden : nil,
+      wantsState: flags.contains(.wantState), wantsStamps: flags.contains(.wantStamps), ran: true, failure: failure)
   }
 
   private func onShutdown(_ message: Message) throws {

@@ -30,6 +30,10 @@ public struct Message {
   public let payload: UnsafeRawBufferPointer
   /// Did it come as datagrams (`FrameDatagrams`)? Only a frame does.
   public var viaDatagram = false
+  /// When its bytes were in hand, on the uptime clock the timings use: the
+  /// moment a frame stopped waiting for the link and started waiting for the
+  /// host. Stamped by whichever read produced it, before the session looks.
+  public var receivedAt: UInt64 = DispatchTime.now().uptimeNanoseconds
 }
 
 /// Framing over a connected TCP socket, as `StreamTransport` and `TcpTransport`

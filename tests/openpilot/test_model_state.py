@@ -16,6 +16,7 @@ code that drives.
 from __future__ import annotations
 
 import contextlib
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -472,9 +473,18 @@ class TestTelemetry(ModelStateTest):
     client.t.send_totals['messages'] += 1
     self.assertEqual(sends[0]['totals']['messages'], 100)
 
-  def test_nothing_back_yet_is_nothing_logged(self):
+  def test_nothing_back_is_a_line_of_what_the_comma_measured(self):
+    """An older phone sends no telemetry: the line still carries this end's own
+    frame stages, and none of the phone's fields. What a phone does send rides
+    on the same line (test_phone_telemetry_fields_appear_in_the_log)."""
     self.run_frames(STATEFUL, n=4)
-    self.assertEqual(self.events, [])
+    self.assertEqual(len(self.events), 1)
+    name, fields = self.events[0]
+    self.assertEqual(name, 'jetlinkTelemetry')
+    self.assertEqual(fields['lat_stamps'], 'none')
+    self.assertGreaterEqual(fields['lat_frames'], 1)
+    self.assertNotIn('wire_p50_ms', fields)
+    self.assertNotIn('temp_c', fields)
 
   def test_a_callback_asks_and_is_called_instead(self):
     client = FakeClient()
@@ -483,6 +493,93 @@ class TestTelemetry(ModelStateTest):
     self.run_frames(STATEFUL, n=3, client=client, after_enqueue=callback)
     self.assertEqual(client.asked, [True, True, True])
     self.assertEqual(callback.call_count, 3)
+
+
+class StampingClient(FakeClient):
+  """A phone that sends its stamps, in the real order: the reply is read, then
+  its FRAME_STAMPS come off the stream, both before the frame loop's next log."""
+
+  spans = (1500, 20_000, 500)   # queue, inference, reply written: 22 ms resident
+
+  def infer_end(self, seq, hold=None):
+    out = super().infer_end(seq, hold)
+    if out is not None:
+      self.on_stamps(seq, *self.spans)
+    return out
+
+
+class TestLatency(ModelStateTest):
+  """Every frame's stages, joined by frame id with the server's own stamps: the
+  frames past HOLD_FRAME included, which used to be published and dropped."""
+
+  def run_all(self, inputs: dict, n: int, client=None):
+    """`n` frames with the 1 Hz line held back, so the window is still whole
+    when the test reads it (run_frames logs through it as a drive would)."""
+    client = client or FakeClient()
+    state = self.make(spec_for(inputs), client)
+    state._last_logged = time.monotonic()
+    self.frames(state, n)
+    return state, client
+
+  def test_a_frame_is_timed_stage_by_stage(self):
+    state, client = self.run_all(STATEFUL, 3)
+    report = state.latency.report()
+    self.assertEqual(report['lat_frames'], 3)
+    self.assertEqual(report['lat_stamps'], 'none')
+    for stage in ('warp', 'send', 'rtt', 'wait', 'publish'):
+      self.assertIn(f'{stage}_p50_ms', report)
+      self.assertIn(f'{stage}_max_ms', report)
+    self.assertNotIn('wire_p50_ms', report, 'no stamps: the round trip holds the phone too')
+
+  def test_the_phone_stages_are_the_ones_only_it_can_measure(self):
+    state, client = self.run_all(STATEFUL, 2, StampingClient())
+    report = state.latency.report()
+    self.assertEqual((report['lat_stamped'], report['lat_stamps']), (2, 'all'))
+    self.assertEqual(report['queue_max_ms'], 1.5)
+    self.assertEqual(report['phone_residence_max_ms'], 22.0)
+    self.assertIn('wire_p50_ms', report)
+    self.assertLessEqual(report['wire_max_ms'], report['rtt_max_ms'])
+
+  def test_a_held_frame_is_counted_and_its_late_reply_measured(self):
+    client = FakeClient()
+    client.late = {2}     # the reply is not back inside the hold
+    state, client = self.run_all(STATEFUL, 3, client)
+    held = state.latency.report()
+    self.assertGreaterEqual(held['lat_held'], 1)
+    self.assertEqual(held['lat_held_late'], 0, 'the reply is still out')
+    # it lands two frames later, and the client says so as it reads it
+    client.on_reply(2, time.perf_counter())
+    late = state.latency.report()
+    self.assertEqual((late['lat_frames'], late['lat_held_late']), (1, 1))
+    self.assertIn('late_reply_max_ms', late)
+    self.assertGreaterEqual(late['late_reply_max_ms'], 0.0)
+
+  def test_a_frame_the_link_could_not_take_is_held_without_a_reply(self):
+    client = FakeClient()
+    client.busy = {2}     # the link is busy: the frame is held, never sent
+    state, client = self.run_all(STATEFUL, 3, client)
+    report = state.latency.report()
+    self.assertEqual((report['lat_held'], report['lat_not_sent']), (1, 1))
+    self.assertNotIn('late_reply_max_ms', report)
+
+  def test_the_line_carries_the_joined_stages_next_to_the_phones_health(self):
+    client = StampingClient()
+    client.last_state = {'gpu_temp': 51.0}
+    state, client = self.run_all(STATEFUL, 2, client)
+    state._last_logged = 0.0         # the log is due: the window goes out
+    self.frames(state, 1)
+    line = [fields for name, fields in self.events if name == 'jetlinkTelemetry'][-1]
+    self.assertEqual(line['gpu_temp'], 51.0)
+    self.assertEqual(line['lat_stamps'], 'all')
+    self.assertIn('wire_max_ms', line)
+    self.assertIn('queue_max_ms', line)
+
+  def test_the_report_does_not_leak_the_frames_a_link_loss_left_out(self):
+    client = FakeClient()
+    client.keep = {2, 3}   # never answered, and nothing reads them again
+    state, client = self.run_all(STATEFUL, 3, client)
+    self.assertEqual(state.latency.report()['lat_frames'], 1)
+    self.assertEqual(state.latency.report(), {}, 'the unanswered frames are still pending')
 
 
 if __name__ == '__main__':

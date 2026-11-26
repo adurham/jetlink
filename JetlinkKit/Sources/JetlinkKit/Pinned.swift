@@ -22,6 +22,8 @@ public enum Pinned {
   public static let inferReqSize: Int = 8
   /// jetlink.protocol.INFER_RESP_SIZE
   public static let inferRespSize: Int = 20
+  /// jetlink.protocol.FRAME_STAMPS_SIZE
+  public static let frameStampsSize: Int = 16
   /// jetlink.transport.base.MAX_MESSAGE
   public static let maxMessage: Int = 16777216
   /// jetlink.protocol.DATAGRAM_MAGIC
@@ -51,12 +53,14 @@ public enum Pinned {
     ("SHUTDOWN_REQ", 17),
     ("SHUTDOWN_RESP", 18),
     ("LEAVE", 19),
+    ("FRAME_STAMPS", 20),
   ]
   /// jetlink.protocol.Flag
   public static let flags: [(name: String, value: UInt32)] = [
     ("RESET_QUEUES", 1),
     ("WANT_STATE", 2),
     ("WANT_HIDDEN", 4),
+    ("WANT_STAMPS", 8),
     ("PADDED", 128),
   ]
   /// jetlink.protocol.Status

@@ -65,6 +65,7 @@ def values() -> list[tuple[str, str, str, str]]:
     ('gadgetTxAlign', 'Int', str(P.GADGET_TX_ALIGN), 'jetlink.protocol.GADGET_TX_ALIGN'),
     ('inferReqSize', 'Int', str(P.INFER_REQ_SIZE), 'jetlink.protocol.INFER_REQ_SIZE'),
     ('inferRespSize', 'Int', str(P.INFER_RESP_SIZE), 'jetlink.protocol.INFER_RESP_SIZE'),
+    ('frameStampsSize', 'Int', str(P.FRAME_STAMPS_SIZE), 'jetlink.protocol.FRAME_STAMPS_SIZE'),
     ('maxMessage', 'Int', str(base.MAX_MESSAGE), 'jetlink.transport.base.MAX_MESSAGE'),
     ('datagramMagic', 'UInt32', hex32(P.DATAGRAM_MAGIC), 'jetlink.protocol.DATAGRAM_MAGIC'),
     ('datagramHeaderSize', 'Int', str(P.DATAGRAM_HEADER_SIZE), 'jetlink.protocol.DATAGRAM_HEADER_SIZE'),

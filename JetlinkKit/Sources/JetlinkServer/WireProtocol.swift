@@ -63,6 +63,10 @@ public enum Wire {
     /// The client stops using the link and says why, with what it measured;
     /// no reply. The connection may stay for a later hello.
     case leave = 19
+    /// What this end measured of one frame. Unsolicited, after its reply, and
+    /// only for a request that set `Flag.wantStamps`: an older comma never
+    /// asks, so it never meets a message it cannot place.
+    case frameStamps = 20
   }
 
   public struct Flag: OptionSet, Sendable {
@@ -75,6 +79,10 @@ public enum Wire {
     /// On INFER_REQ: keep hidden_state in the response, for a comma logging
     /// the whole output vector.
     public static let wantHidden = Flag(rawValue: 1 << 2)
+    /// On INFER_REQ: follow the reply with FRAME_STAMPS for this frame, so the
+    /// comma can split its frame's phone time from the wire. A server that
+    /// does not know the flag ignores it, and the comma logs the round trip.
+    public static let wantStamps = Flag(rawValue: 1 << 3)
     /// One pad byte follows the payload; see packetMultiple.
     public static let padded = Flag(rawValue: 1 << 7)
   }
@@ -92,6 +100,9 @@ public enum Wire {
   public static let inferReqSize = Pinned.inferReqSize
   /// INFER_RESP: frame_id, status, gpu_us, queue_us, total_us.
   public static let inferRespSize = Pinned.inferRespSize
+  /// FRAME_STAMPS: frame_id, then the three spans this end measured of it, in
+  /// microseconds. Spans, not timestamps: the phone's clock is not the comma's.
+  public static let frameStampsSize = Pinned.frameStampsSize
 
   public struct Header: Equatable, Sendable {
     public var msgType: UInt16
@@ -191,6 +202,24 @@ public enum Wire {
     var bytes = [UInt8](repeating: 0, count: inferRespSize)
     bytes.withUnsafeMutableBytes {
       packInferResp(frameID: frameID, status: status, gpuUs: gpuUs, queueUs: queueUs, totalUs: totalUs, into: $0.baseAddress!)
+    }
+    return bytes
+  }
+
+  /// '<IIII': frame_id, then the request's arrival to the inference starting,
+  /// the inference, and the reply written, in microseconds. A frame's residence
+  /// on this end is their sum: what the comma cannot see for itself.
+  public static func packFrameStamps(frameID: UInt32, queueUs: UInt32, inferUs: UInt32, sendUs: UInt32, into out: UnsafeMutableRawPointer) {
+    out.storeBytes(of: frameID.littleEndian, toByteOffset: 0, as: UInt32.self)
+    out.storeBytes(of: queueUs.littleEndian, toByteOffset: 4, as: UInt32.self)
+    out.storeBytes(of: inferUs.littleEndian, toByteOffset: 8, as: UInt32.self)
+    out.storeBytes(of: sendUs.littleEndian, toByteOffset: 12, as: UInt32.self)
+  }
+
+  public static func frameStamps(frameID: UInt32, queueUs: UInt32, inferUs: UInt32, sendUs: UInt32) -> [UInt8] {
+    var bytes = [UInt8](repeating: 0, count: frameStampsSize)
+    bytes.withUnsafeMutableBytes {
+      packFrameStamps(frameID: frameID, queueUs: queueUs, inferUs: inferUs, sendUs: sendUs, into: $0.baseAddress!)
     }
     return bytes
   }

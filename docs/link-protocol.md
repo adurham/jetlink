@@ -62,6 +62,14 @@ bench tools). There is one version: update the comma and Jetlink together.
   float32 without `hidden_state`: 8,324 bytes for the current models (73,860
   with it). The comma sets WANT_HIDDEN on a frame to get the whole vector, for
   logging every output; WANT_STATE appends the server's telemetry as JSON.
+- **FRAME_STAMPS.** 48 bytes after a reply, and only for a frame whose INFER_REQ
+  set WANT_STAMPS: the frame id, then what the server measured of it on its own
+  clock, in microseconds — the request's arrival to the inference starting, the
+  inference itself, and its reply written. The comma subtracts their sum from
+  the round trip and logs what is left as the wire, which is the only way to
+  tell a phone's own time from the cable's. An older comma never asks, so it
+  never meets a message it does not know; an older server ignores the flag and
+  the comma logs the round trip alone.
 - **Hidden state on the server.** A queued model (BMRLNAP, Cinque Terre V2,
   Lebowski) feeds each frame's `hidden_state` into the next frame, where
   openpilot's modeld feeds its own. The server keeps it: zero when an engine
