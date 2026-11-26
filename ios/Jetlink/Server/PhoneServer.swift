@@ -72,7 +72,7 @@ final class PhoneServer: ServerControlling {
   let modelEvents: AsyncStream<ControlEvent>
 
   /// How far back the dashboard's headline reaches.
-  static let recentWindow: TimeInterval = 10
+  nonisolated static let recentWindow: TimeInterval = 10   // read from the nonisolated telemetry sample()
 
   let settings: PhoneSettings
   /// Where the cable is: the server dials the comma while the phone has an
