@@ -13,6 +13,9 @@ final class FrameStats: @unchecked Sendable {
 
   /// A frame over this on the server counts as slow.
   static let slowUs: UInt32 = 60_000
+  /// The comma's hold deadline: a frame whose server total is past this is
+  /// a held frame. Phone telemetry counts how often the server itself is over.
+  static let deadlineUs: UInt32 = 46_000
 
   private let lock = NSLock()
   private var samples: [Sample] = []
@@ -65,6 +68,37 @@ final class FrameStats: @unchecked Sendable {
       windowS: pythonRound(seconds, 1),
       totalMs: spread(rows.map(\.totalUs)),
       gpuMs: StatsEvent.Mean(mean: round2(gpu)))
+  }
+
+  /// Phone-side telemetry: p50/p95/max and the count over the 46 ms hold
+  /// deadline, as a JSON-ready dictionary. Empty when no frame landed.
+  func telemetryTiming(window seconds: TimeInterval) -> [String: Any] {
+    let cutoff = now() - seconds
+    lock.lock()
+    let rows = samples.filter { $0.at >= cutoff }
+    lock.unlock()
+    guard !rows.isEmpty else { return [:] }
+    func ms(_ us: UInt32) -> Double { Double(us) / 1000.0 }
+    func sortedMs(_ key: (Sample) -> UInt32) -> [Double] { rows.map { ms(key($0)) }.sorted() }
+    func percentile(_ fraction: Double, _ values: [Double]) -> Double {
+      guard !values.isEmpty else { return 0 }
+      let index = min(values.count - 1, Int((fraction * Double(values.count - 1)).rounded()))
+      return round2(values[index])
+    }
+    let totals = sortedMs(\.totalUs)
+    let gpus = sortedMs(\.gpuUs)
+    let queues = sortedMs(\.queueUs)
+    return [
+      "window_s": pythonRound(seconds, 1),
+      "count": rows.count,
+      "total_p50_ms": percentile(0.5, totals),
+      "total_p95_ms": percentile(0.95, totals),
+      "total_max_ms": percentile(1.0, totals),
+      "gpu_p50_ms": percentile(0.5, gpus),
+      "gpu_max_ms": percentile(1.0, gpus),
+      "queue_p50_ms": percentile(0.5, queues),
+      "over_46ms": rows.filter { $0.totalUs > FrameStats.deadlineUs }.count,
+    ]
   }
 }
 

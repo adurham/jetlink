@@ -2,8 +2,57 @@ import Foundation
 import JetlinkKit
 import JetlinkORT
 import JetlinkServer
+import JetlinkUI
 import Observation
 import os
+
+/// A thread-safe source for the phone-side telemetry the comma's rlog gets.
+/// Written on MainActor by the app as the device's health and scene state
+/// change; read off the frame path by the server's telemetry sampler.
+final class PhoneTelemetrySource: @unchecked Sendable {
+  private let lock = NSLock()
+  private var _health: DeviceHealth = .init()
+  private var _sceneActive: Bool = true
+  private weak var _server: Server?
+
+  func update(health: DeviceHealth, sceneActive: Bool) {
+    lock.withLock {
+      _health = health
+      _sceneActive = sceneActive
+    }
+  }
+
+  func attach(server: Server) {
+    lock.withLock { _server = server }
+  }
+
+  /// The telemetry payload for the next STATE_RESP / WANT_STATE reply.
+  func sample() -> [String: Any] {
+    let (health, sceneActive, server): (DeviceHealth, Bool, Server?)
+    lock.withLock {
+      health = _health
+      sceneActive = _sceneActive
+      server = _server
+    }
+    var report: [String: Any] = [
+      "thermal_state": health.thermal.label,
+      "low_power_mode": health.lowPowerMode,
+      "app_state": sceneActive ? "foreground" : "background",
+    ]
+    if let memory = health.availableMemory {
+      report["available_memory_mb"] = round2(Double(memory) / Double(1 << 20))
+    }
+    if let timing = server?.telemetryTiming(window: PhoneServer.recentWindow), !timing.isEmpty {
+      report.merge(timing) { current, _ in current }
+    }
+    return report
+  }
+}
+
+/// Round a Double to two decimal places, matching the server's own rounding.
+private func round2(_ value: Double) -> Double {
+  (value * 100).rounded() / 100
+}
 
 /// The jetlink server inside the app, and everything the views read about it.
 /// The iPhone's `ServerStore`: the same events and commands the Mac app has,
@@ -35,9 +84,17 @@ final class PhoneServer: ServerControlling {
   @ObservationIgnored private var consumeTask: Task<Void, Never>?
   @ObservationIgnored private var recentTask: Task<Void, Never>?
   @ObservationIgnored private let log = Logger(subsystem: "io.zoompilot.jetlink", category: "app")
+  /// The source the server reads for phone-side telemetry sent to the comma.
+  @ObservationIgnored let telemetry = PhoneTelemetrySource()
 
   /// What the in-process server logs, for a Logs view.
   let logs = LogBuffer()
+
+  /// Called when the app's scene phase or the device health changes, so the
+  /// telemetry payload reflects the phone's current state.
+  func updateTelemetry(health: DeviceHealth, sceneActive: Bool) {
+    telemetry.update(health: health, sceneActive: sceneActive)
+  }
 
   init(settings: PhoneSettings, network: NetworkInterfaces) {
     self.settings = settings
@@ -106,12 +163,17 @@ final class PhoneServer: ServerControlling {
     lastFailure = nil
     do {
       let root = try PhoneServer.prepareCacheDirectory()
+      let hooks = ServerHooks(
+        telemetry: { [weak telemetry] in telemetry?.sample() ?? [:] },
+        thermal: { [weak telemetry] in telemetry?.sample()["thermal_state"] as? String ?? platformThermal() })
       let embedded = try EmbeddedServer(
         // The listener is only for bench tools over Wi-Fi; the comma never dials the phone.
         configuration: Server.Configuration(port: settings.port, cacheRoot: root, listen: settings.developer, keepPlans: 2),
         backend: OrtBackend(
-          profile: settings.device, preparer: ONNXPreparer(), keepAlive: settings.keepGPUAwake, keepCPUWarm: settings.keepCPUWarm))
+          profile: settings.device, preparer: ONNXPreparer(), keepAlive: settings.keepGPUAwake, keepCPUWarm: settings.keepCPUWarm),
+        hooks: hooks)
       self.embedded = embedded
+      telemetry.attach(server: embedded.server)
       consumeTask = Task { [weak self] in
         for await event in embedded.events {
           self?.apply(event)

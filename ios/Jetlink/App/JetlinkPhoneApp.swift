@@ -13,6 +13,7 @@ struct JetlinkPhoneApp: App {
         .onAppear { app.launch() }
         .onChange(of: scenePhase) { _, phase in
           app.sceneActive = phase == .active
+          app.syncTelemetry()
           if phase == .background && app.server.runState == .serving {
             app.server.note(.warning, "Jetlink went to the background; the system suspends it there and the comma loses the big model. Keep Jetlink on screen.")
           }

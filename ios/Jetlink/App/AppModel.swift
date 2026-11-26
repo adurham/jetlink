@@ -28,6 +28,7 @@ final class AppModel {
     self.network = network
     self.localNetwork = LocalNetworkAccess()
     device.warn = { [weak server] in server?.note(.warning, $0) }
+    watchDevice()
   }
 
   /// The server starts with the app: it has nothing else to do,
@@ -38,6 +39,18 @@ final class AppModel {
     server.start()
     localNetwork.check()
     models.refreshCatalog()
+  }
+
+  private func watchDevice() {
+    withObservationTracking {
+      _ = device.health
+    } onChange: { [weak self] in
+      Task { @MainActor in self?.syncTelemetry(); self?.watchDevice() }
+    }
+  }
+
+  func syncTelemetry() {
+    server.updateTelemetry(health: device.health, sceneActive: sceneActive)
   }
 
   /// Everything the Status tab draws, from the stores.

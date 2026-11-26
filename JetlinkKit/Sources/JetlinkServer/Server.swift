@@ -263,6 +263,12 @@ public final class Server: @unchecked Sendable {
     host.frameStats.summary(window: window, framesTotal: framesServed)
   }
 
+  /// Phone-side telemetry timing: p50/p95/max and the count over the 46 ms
+  /// hold deadline, as a JSON-ready dictionary. Empty when no frame landed.
+  public func telemetryTiming(window: TimeInterval) -> [String: Any] {
+    host.frameStats.telemetryTiming(window: window)
+  }
+
   /// Stops listening, dialing and serving. The engine stays loaded, for a
   /// server that will be started again; `shutdown()` releases it.
   public func stop() {

@@ -96,6 +96,16 @@
       }
     }
 
+    /// The word a telemetry payload or a report stores: nominal, fair, serious, critical.
+    public var label: String {
+      switch self {
+      case .nominal: "nominal"
+      case .fair: "fair"
+      case .serious: "serious"
+      case .critical: "critical"
+      }
+    }
+
     public var title: String {
       switch self {
       case .nominal: "Normal"

@@ -55,7 +55,7 @@ class FakeClient:
     self.sent = []
     self.asked = []
     self.last_timings = (0, 0, 0)
-    self.last_state = None
+    self.last_state: dict | None = None
     self.dead = False
     self.t = SimpleNamespace()
     self.output = np.zeros(18452, np.float32)
@@ -483,6 +483,54 @@ class TestTelemetry(ModelStateTest):
     self.run_frames(STATEFUL, n=3, client=client, after_enqueue=callback)
     self.assertEqual(client.asked, [True, True, True])
     self.assertEqual(callback.call_count, 3)
+
+  def test_phone_telemetry_fields_appear_in_the_log(self):
+    """A phone with the update sends thermal state, power mode, app state,
+    memory and a frame timing window; they land in jetlinkTelemetry."""
+    client = FakeClient()
+    client.last_state = {
+      'thermal_state': 'serious',
+      'low_power_mode': True,
+      'app_state': 'background',
+      'available_memory_mb': 1.5,
+      'window_s': 10.0,
+      'count': 200,
+      'total_p50_ms': 24.5,
+      'total_p95_ms': 37.1,
+      'total_max_ms': 48.2,
+      'gpu_p50_ms': 21.0,
+      'gpu_max_ms': 35.0,
+      'queue_p50_ms': 0.6,
+      'over_46ms': 3,
+    }
+    self.run_frames(STATEFUL, n=6, client=client)
+    telemetry = [fields for name, fields in self.events if name == 'jetlinkTelemetry']
+    self.assertEqual(len(telemetry), 1)
+    self.assertEqual(telemetry[0]['dead'], False)
+    for key in client.last_state:
+      self.assertIn(key, telemetry[0])
+      self.assertEqual(telemetry[0][key], client.last_state[key])
+
+  def test_a_phone_without_telemetry_still_runs(self):
+    """Backward compatibility: an older phone/server sends no telemetry, and
+    the comma's model state does not log or crash."""
+    for state in (None, {}):
+      with self.subTest(state=state):
+        client = FakeClient()
+        client.last_state = state
+        self.run_frames(STATEFUL, n=6, client=client)
+        self.assertEqual([name for name, _ in self.events], [])
+
+  def test_extra_telemetry_fields_pass_through_unharmed(self):
+    """The schema is additive: a future phone can add keys without breaking
+    the log path."""
+    client = FakeClient()
+    client.last_state = {'thermal_state': 'fair', 'future_field': [1, 2, 3]}
+    self.run_frames(STATEFUL, n=6, client=client)
+    telemetry = [fields for name, fields in self.events if name == 'jetlinkTelemetry']
+    self.assertEqual(len(telemetry), 1)
+    self.assertEqual(telemetry[0]['thermal_state'], 'fair')
+    self.assertEqual(telemetry[0]['future_field'], [1, 2, 3])
 
 
 if __name__ == '__main__':
