@@ -28,11 +28,8 @@ final class PhoneTelemetrySource: @unchecked Sendable {
 
   /// The telemetry payload for the next STATE_RESP / WANT_STATE reply.
   func sample() -> [String: Any] {
-    let (health, sceneActive, server): (DeviceHealth, Bool, Server?)
-    lock.withLock {
-      health = _health
-      sceneActive = _sceneActive
-      server = _server
+    let (health, sceneActive, server): (DeviceHealth, Bool, Server?) = lock.withLock {
+      (_health, _sceneActive, _server)
     }
     var report: [String: Any] = [
       "thermal_state": health.thermal.label,
