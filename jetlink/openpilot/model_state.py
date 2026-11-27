@@ -53,7 +53,7 @@ HOLD_FRAME = 0.046
 # lets a quiet host run to, so a run of holds is always a host that answers,
 # late; one that has stopped answering fails the link first
 # (JetlinkClient.infer_begin), as a lost link
-HOLDS_IN_A_ROW = 5
+HOLDS_IN_A_ROW = 10
 HOLDS_ALLOWED = 20
 HOLD_WINDOW = 10.0
 # The first frames after a swap, which the fork holds engagement off for (a
